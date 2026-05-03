@@ -201,7 +201,7 @@ def _row_to_dict(row) -> dict:
 # Public API
 # ---------------------------------------------------------------------------
 
-def run_evaluation(
+async def run_evaluation(
     run_id: str,
     retrieval_strategy: str,
     chunker_strategy: str,
@@ -214,14 +214,17 @@ def run_evaluation(
     corpus_hash: str,
 ) -> None:
     """
-    Sync entry point registered with FastAPI BackgroundTasks.
+    Async entry point registered with FastAPI BackgroundTasks.
 
-    FastAPI's BackgroundTasks dispatcher (via anyio) runs non-async callables
-    in a thread pool. That thread has no asyncio event loop, so calling an
-    async function directly from it raises RuntimeError: "There is no current
-    event loop in thread". This wrapper calls asyncio.run() which creates a
-    dedicated event loop for the thread and drives _run_evaluation_async to
-    completion inside it.
+    Declared async so FastAPI awaits it directly on the main event loop
+    rather than dispatching it to anyio's thread pool. The sync wrapper
+    approach (asyncio.run / anyio.run inside a worker thread) caused two
+    separate production failures:
+      - asyncio.run(): "Can't patch loop of type uvloop.Loop" from nest_asyncio
+      - anyio.run(): "Timeout should be used inside a task" because FastAPI's
+        anyio token on the thread conflicted with a nested anyio.run() call
+
+    Awaiting _run_evaluation_async directly avoids both issues entirely.
 
     Parameters
     ----------
@@ -253,39 +256,23 @@ def run_evaluation(
         retrieval_strategy,
     )
     try:
-        # Force the standard asyncio event loop policy for this background
-        # thread. FastAPI dispatches sync background callables via
-        # anyio.to_thread.run_sync(), which leaves an anyio token on the
-        # thread. Calling anyio.run() from that thread conflicts with the
-        # existing token and causes "Timeout should be used inside a task"
-        # from anyio's internal timeout machinery. asyncio.run() with
-        # DefaultEventLoopPolicy creates a fully isolated standard asyncio
-        # event loop that is not affected by the parent anyio context.
-        # uvicorn installs uvloop as the process-wide default policy, but
-        # RAGAS uses nest_asyncio which cannot patch uvloop -- the policy
-        # override here is scoped to this background thread only and does
-        # not affect the main FastAPI event loop.
-        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-        asyncio.run(
-            _run_evaluation_async(
-                run_id=run_id,
-                retrieval_strategy=retrieval_strategy,
-                chunker_strategy=chunker_strategy,
-                retrieval_params=retrieval_params,
-                chunker_params=chunker_params,
-                compression_enabled=compression_enabled,
-                compression_params=compression_params,
-                corpus=corpus,
-                question=question,
-                corpus_hash=corpus_hash,
-            )
+        await _run_evaluation_async(
+            run_id=run_id,
+            retrieval_strategy=retrieval_strategy,
+            chunker_strategy=chunker_strategy,
+            retrieval_params=retrieval_params,
+            chunker_params=chunker_params,
+            compression_enabled=compression_enabled,
+            compression_params=compression_params,
+            corpus=corpus,
+            question=question,
+            corpus_hash=corpus_hash,
         )
     except BaseException as exc:
         # _run_evaluation_async writes status='failed' and returns normally.
         # This outer handler catches anything that still escapes (e.g. an
-        # error inside the async error handler itself). FastAPI's BackgroundTasks
-        # runner silently swallows exceptions from background callables, so we
-        # must log here or the crash is invisible in production logs.
+        # error inside the async error handler itself). FastAPI swallows
+        # exceptions from background tasks silently, so log here.
         print(f"[DEBUG] run_evaluation CRASHED: {exc}", flush=True)
         logger.exception(
             "run_evaluation: unhandled crash for run_id=%s: %s", run_id, exc

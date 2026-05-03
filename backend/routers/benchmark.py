@@ -146,5 +146,6 @@ async def create_benchmark(
         question=body.question,
         corpus_hash=body.corpus_hash,
     )
+    print(f"[DEBUG] add_task called for run_id={run_id}", flush=True)
 
     return JSONResponse(status_code=202, content={"run_id": run_id})
