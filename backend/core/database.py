@@ -119,6 +119,33 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
+async def make_task_pool() -> asyncpg.Pool:
+    """
+    Create and return a fresh connection pool for a background task.
+
+    Unlike get_pool(), this does NOT return the module-level singleton. Each
+    call creates a new pool bound to the currently running event loop. Callers
+    are responsible for closing the pool when their work is done.
+
+    Background tasks that run under asyncio.run() execute on a brand-new event
+    loop that is different from the FastAPI main event loop. asyncpg pools are
+    tied to the event loop they were created on, so reusing the singleton pool
+    from a different loop raises an event-loop mismatch error. Creating a
+    dedicated pool here avoids that entirely.
+
+    Returns
+    -------
+    asyncpg.Pool
+        Ready-to-use pool bound to the caller's event loop. Must be closed
+        by the caller (e.g. in a try/finally block).
+    """
+    return await asyncpg.create_pool(
+        **_parse_db_kwargs(),
+        init=_init_connection,
+        statement_cache_size=0,
+    )
+
+
 async def close_pool() -> None:
     """
     Gracefully close all connections in the pool.
