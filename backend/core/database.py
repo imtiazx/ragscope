@@ -114,6 +114,7 @@ async def get_pool() -> asyncpg.Pool:
         _pool = await asyncpg.create_pool(
             **_parse_db_kwargs(),
             init=_init_connection,
+            statement_cache_size=0,
         )
     return _pool
 
