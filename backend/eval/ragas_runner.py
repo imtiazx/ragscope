@@ -31,8 +31,6 @@ import time
 import uuid
 from typing import Optional
 
-import anyio
-
 from backend.core.config import settings
 from backend.core.database import get_pool, make_task_pool
 from backend.llm.openai_provider import OpenAIProvider
@@ -255,25 +253,32 @@ def run_evaluation(
         retrieval_strategy,
     )
     try:
-        # anyio.run() creates a proper anyio task context in this background
-        # thread. asyncio.run() was previously used here but anyio's internal
-        # timeouts (fail_after / move_on_after) require an anyio task context
-        # and raise "Timeout should be used inside a task" when called under a
-        # plain asyncio.run(). anyio.run() also selects the asyncio backend by
-        # default, which is compatible with nest_asyncio (unlike uvloop), so
-        # the asyncio.set_event_loop_policy override is no longer needed.
-        anyio.run(
-            _run_evaluation_async,
-            run_id,
-            retrieval_strategy,
-            chunker_strategy,
-            retrieval_params,
-            chunker_params,
-            compression_enabled,
-            compression_params,
-            corpus,
-            question,
-            corpus_hash,
+        # Force the standard asyncio event loop policy for this background
+        # thread. FastAPI dispatches sync background callables via
+        # anyio.to_thread.run_sync(), which leaves an anyio token on the
+        # thread. Calling anyio.run() from that thread conflicts with the
+        # existing token and causes "Timeout should be used inside a task"
+        # from anyio's internal timeout machinery. asyncio.run() with
+        # DefaultEventLoopPolicy creates a fully isolated standard asyncio
+        # event loop that is not affected by the parent anyio context.
+        # uvicorn installs uvloop as the process-wide default policy, but
+        # RAGAS uses nest_asyncio which cannot patch uvloop -- the policy
+        # override here is scoped to this background thread only and does
+        # not affect the main FastAPI event loop.
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+        asyncio.run(
+            _run_evaluation_async(
+                run_id=run_id,
+                retrieval_strategy=retrieval_strategy,
+                chunker_strategy=chunker_strategy,
+                retrieval_params=retrieval_params,
+                chunker_params=chunker_params,
+                compression_enabled=compression_enabled,
+                compression_params=compression_params,
+                corpus=corpus,
+                question=question,
+                corpus_hash=corpus_hash,
+            )
         )
     except BaseException as exc:
         # _run_evaluation_async writes status='failed' and returns normally.
