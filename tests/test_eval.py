@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from backend.eval.ragas_runner import run_evaluation, get_run, _row_to_dict
+from backend.eval.ragas_runner import _run_evaluation_async, get_run, _row_to_dict
 from backend.retrieval.base import RetrievalResult
 
 
@@ -80,6 +80,9 @@ class _MockPool:
     def acquire(self) -> _MockAcquireCtx:
         """Return an async context manager wrapping the fixed connection."""
         return _MockAcquireCtx(self._conn)
+
+    async def close(self) -> None:
+        """No-op: nothing to tear down for an in-memory mock pool."""
 
 
 class _MockRetriever:
@@ -155,7 +158,7 @@ async def test_status_transitions_to_running_then_completed():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.get_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
@@ -164,7 +167,7 @@ async def test_status_transitions_to_running_then_completed():
         mock_gen.return_value = "generated answer text"
         mock_ragas.return_value = _MOCK_SCORES
 
-        await run_evaluation(
+        await _run_evaluation_async(
             run_id=_RUN_ID,
             retrieval_strategy="naive",
             chunker_strategy="fixed_size",
@@ -195,7 +198,7 @@ async def test_completed_run_writes_all_metric_fields():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.get_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
@@ -204,7 +207,7 @@ async def test_completed_run_writes_all_metric_fields():
         mock_gen.return_value = "answer"
         mock_ragas.return_value = _MOCK_SCORES
 
-        await run_evaluation(
+        await _run_evaluation_async(
             run_id=_RUN_ID,
             retrieval_strategy="naive",
             chunker_strategy="fixed_size",
@@ -242,7 +245,7 @@ async def test_failed_run_sets_status_to_failed():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.get_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
@@ -251,7 +254,7 @@ async def test_failed_run_sets_status_to_failed():
         mock_gen.return_value = "answer"
         mock_ragas.side_effect = RuntimeError("RAGAS evaluation failed")
 
-        await run_evaluation(
+        await _run_evaluation_async(
             run_id=_RUN_ID,
             retrieval_strategy="naive",
             chunker_strategy="fixed_size",
@@ -279,7 +282,7 @@ async def test_failed_run_writes_error_message():
     pool, conn = _make_pool_and_conn()
     error_text = "Connection to RAGAS LLM judge timed out"
 
-    with patch("backend.eval.ragas_runner.get_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
@@ -288,7 +291,7 @@ async def test_failed_run_writes_error_message():
         mock_gen.return_value = "answer"
         mock_ragas.side_effect = RuntimeError(error_text)
 
-        await run_evaluation(
+        await _run_evaluation_async(
             run_id=_RUN_ID,
             retrieval_strategy="naive",
             chunker_strategy="fixed_size",
@@ -328,7 +331,7 @@ async def test_run_evaluation_never_raises():
 
     conn.execute = always_raise
 
-    with patch("backend.eval.ragas_runner.get_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
@@ -338,7 +341,7 @@ async def test_run_evaluation_never_raises():
         mock_ragas.return_value = _MOCK_SCORES
 
         # Must return normally -- no exception should escape.
-        result = await run_evaluation(
+        result = await _run_evaluation_async(
             run_id=_RUN_ID,
             retrieval_strategy="naive",
             chunker_strategy="fixed_size",
@@ -369,13 +372,13 @@ async def test_retrieval_failure_is_caught_as_failed():
         async def retrieve(self, query, top_k):
             raise ValueError("Corpus is empty")
 
-    with patch("backend.eval.ragas_runner.get_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry",
                {"naive": _ExplodingRetriever}):
 
         mock_gp.return_value = pool
 
-        await run_evaluation(
+        await _run_evaluation_async(
             run_id=_RUN_ID,
             retrieval_strategy="naive",
             chunker_strategy="fixed_size",

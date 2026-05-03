@@ -1,15 +1,23 @@
 """
 RAGAS evaluation runner for RAGScope.
 
-Implements the async background task that executes a full benchmark run:
-retrieval, optional contextual compression, answer generation, and RAGAS
-metric computation. Results are persisted to the benchmark_runs table so
-the frontend can poll for them by run_id.
+Implements the background task that executes a full benchmark run: retrieval,
+optional contextual compression, answer generation, and RAGAS metric
+computation. Results are persisted to the benchmark_runs table so the frontend
+can poll for them by run_id.
 
-This module is designed to be safe as a FastAPI BackgroundTask -- run_evaluation
-catches all exceptions and never propagates them, because an unhandled exception
-in a background task silently kills the task with no way to report the failure
-to the user.
+Public entry point: run_evaluation() is a regular (non-async) function.
+FastAPI's BackgroundTasks dispatcher runs non-async callables in a thread pool
+via anyio. That thread has no asyncio event loop, so any awaitable called
+directly from it raises "There is no current event loop in thread". The sync
+wrapper calls asyncio.run(), which creates a fresh event loop for the thread
+and drives the async implementation to completion inside it.
+
+The async implementation (_run_evaluation_async) creates its own database pool
+via make_task_pool() rather than using the module-level singleton from get_pool().
+asyncpg pools are bound to the event loop they were created on; the singleton is
+owned by the FastAPI main event loop and cannot be used from the background
+thread's separate event loop.
 
 RAGAS and its datasets dependency are imported lazily inside _run_ragas() so
 that this module is importable in test environments where those packages are not
@@ -23,7 +31,7 @@ import uuid
 from typing import Optional
 
 from backend.core.config import settings
-from backend.core.database import get_pool
+from backend.core.database import get_pool, make_task_pool
 from backend.llm.openai_provider import OpenAIProvider
 from backend.retrieval.base import RetrievalResult
 from backend.retrieval.registry import registry as retrieval_registry
@@ -181,7 +189,7 @@ def _row_to_dict(row) -> dict:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def run_evaluation(
+def run_evaluation(
     run_id: str,
     retrieval_strategy: str,
     chunker_strategy: str,
@@ -194,42 +202,25 @@ async def run_evaluation(
     corpus_hash: str,
 ) -> None:
     """
-    Execute a full benchmark run and persist all results to the database.
+    Sync entry point registered with FastAPI BackgroundTasks.
 
-    This function is designed to be called as a FastAPI BackgroundTask. It
-    NEVER raises an exception -- all failures are caught, written to the
-    database as status='failed' with an error_message, and the function
-    returns normally. This is critical because an unhandled exception in a
-    background task terminates the task silently with no HTTP response to
-    inform the user.
-
-    Execution flow:
-      1. Set status='running'
-      2. Initialise retriever and run retrieval
-      3. Optionally apply contextual compression
-      4. Generate an answer from retrieved contexts via LLM
-      5. Run RAGAS evaluation for all three metrics
-      6. Write scores, answer, and chunks to the database
-      7. Set status='completed'
-
-    On any exception at any step:
-      - Set status='failed' with error_message=str(exception)
-      - Return without re-raising
+    FastAPI's BackgroundTasks dispatcher (via anyio) runs non-async callables
+    in a thread pool. That thread has no asyncio event loop, so calling an
+    async function directly from it raises RuntimeError: "There is no current
+    event loop in thread". This wrapper calls asyncio.run() which creates a
+    dedicated event loop for the thread and drives _run_evaluation_async to
+    completion inside it.
 
     Parameters
     ----------
     run_id : str
-        UUID string of the pre-created benchmark_runs row. The row must
-        already exist in the database with status='pending'.
+        UUID string of the pre-created benchmark_runs row.
     retrieval_strategy : str
         Registry key of the retrieval strategy (e.g. 'naive', 'hyde').
     chunker_strategy : str
         Registry key of the chunking strategy used to produce the corpus.
-        Stored for provenance; not used to re-chunk during evaluation.
     retrieval_params : dict
         Parameters for the retriever constructor and retrieve() call.
-        Must include 'top_k' at minimum. Additional keys are forwarded
-        to the retriever constructor as kwargs.
     chunker_params : dict
         Parameters used when the corpus was chunked. Stored for provenance.
     compression_enabled : bool
@@ -237,15 +228,63 @@ async def run_evaluation(
     compression_params : dict
         Parameters for ContextualCompressor. Used only if compression_enabled.
     corpus : list[dict]
-        Pre-embedded chunks to search. Each dict must have chunk_id, content,
-        and embedding keys.
+        Pre-embedded chunks with chunk_id, content, and embedding keys.
     question : str
         The benchmark question to answer and evaluate.
     corpus_hash : str
-        Hash identifying the corpus. Stored for provenance and to allow
-        grouping runs that used the same source documents.
+        Hash identifying the corpus, stored for provenance.
     """
-    pool = await get_pool()
+    asyncio.run(
+        _run_evaluation_async(
+            run_id=run_id,
+            retrieval_strategy=retrieval_strategy,
+            chunker_strategy=chunker_strategy,
+            retrieval_params=retrieval_params,
+            chunker_params=chunker_params,
+            compression_enabled=compression_enabled,
+            compression_params=compression_params,
+            corpus=corpus,
+            question=question,
+            corpus_hash=corpus_hash,
+        )
+    )
+
+
+async def _run_evaluation_async(
+    run_id: str,
+    retrieval_strategy: str,
+    chunker_strategy: str,
+    retrieval_params: dict,
+    chunker_params: dict,
+    compression_enabled: bool,
+    compression_params: dict,
+    corpus: list[dict],
+    question: str,
+    corpus_hash: str,
+) -> None:
+    """
+    Async implementation of a full benchmark run.
+
+    Called exclusively via run_evaluation() which drives it with asyncio.run().
+    Creates its own database pool via make_task_pool() rather than reusing the
+    module-level singleton from get_pool(). asyncpg pools are bound to the event
+    loop they were created on; the singleton belongs to the FastAPI main event
+    loop and cannot be used from the separate event loop created by asyncio.run().
+
+    NEVER raises an exception -- all failures are caught, written to the database
+    as status='failed' with an error_message, and the function returns normally.
+
+    Execution flow:
+      1. Set status='running'
+      2. Initialise retriever and run retrieval
+      3. Optionally apply contextual compression
+      4. Generate an answer from retrieved contexts via LLM
+      5. Run RAGAS evaluation for all three metrics
+      6. Write scores, answer, and chunks to the database; set status='completed'
+
+    Parameters match run_evaluation() exactly.
+    """
+    pool = await make_task_pool()
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
 
@@ -340,6 +379,9 @@ async def run_evaluation(
                 )
         except Exception:
             pass
+
+    finally:
+        await pool.close()
 
 
 async def get_run(run_id: str) -> Optional[dict]:
