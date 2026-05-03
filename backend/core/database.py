@@ -15,11 +15,51 @@ Two tables are managed here:
 """
 
 import json
+from urllib.parse import urlparse
 
 import asyncpg
 from pgvector.asyncpg import register_vector
 
 from backend.core.config import settings
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+
+
+def _parse_db_kwargs() -> dict:
+    """
+    Parse SUPABASE_URL into individual keyword arguments for asyncpg.
+
+    asyncpg's internal DSN parser rejects some valid Postgres URLs -- notably,
+    Supabase connection-pooler hostnames containing dots and hyphens can be
+    misidentified as malformed IPv6 literals, raising ValueError at startup.
+    Parsing with urllib.parse.urlparse bypasses asyncpg's parser entirely and
+    passes each component directly, which works regardless of hostname format.
+
+    SSL behaviour:
+    - localhost / 127.0.0.1: no SSL (local Docker Postgres has no certificate).
+    - any other host: ssl="require" (Supabase and all remote Postgres instances
+      must use encrypted connections).
+
+    Returns
+    -------
+    dict
+        Keyword arguments suitable for asyncpg.create_pool() or
+        asyncpg.connect(): host, port, user, password, database, and
+        optionally ssl.
+    """
+    parsed = urlparse(settings.supabase_url)
+    host = parsed.hostname or ""
+    kwargs: dict = {
+        "host": host,
+        "port": parsed.port or 5432,
+        "user": parsed.username,
+        "password": parsed.password,
+        "database": parsed.path.lstrip("/"),
+    }
+    if host not in _LOCAL_HOSTS:
+        kwargs["ssl"] = "require"
+    return kwargs
 
 
 # Module-level pool singleton. None until get_pool() is called for the first
@@ -64,12 +104,15 @@ async def get_pool() -> asyncpg.Pool:
     Returns
     -------
     asyncpg.Pool
-        Ready-to-use connection pool pointed at the configured database URL.
+        Ready-to-use connection pool pointed at the configured database.
+        Connection parameters are parsed from SUPABASE_URL by _parse_db_kwargs
+        rather than passed as a raw DSN string, which avoids asyncpg's internal
+        URL parser that misidentifies some Supabase hostnames as IPv6 literals.
     """
     global _pool
     if _pool is None:
         _pool = await asyncpg.create_pool(
-            settings.supabase_url,
+            **_parse_db_kwargs(),
             init=_init_connection,
         )
     return _pool
