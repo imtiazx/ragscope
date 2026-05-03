@@ -1,0 +1,234 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* -------------------------------------------------------------------------
+   Design token CSS variables
+   Light theme is the default (matches :root / data-theme="light").
+   Dark theme overrides follow via [data-theme='dark'].
+   All Tailwind color utilities (bg-background, text-accent, etc.) resolve
+   to these variables, so a single attribute change on <html> repaints the
+   entire app without any JavaScript recalculation.
+   ---------------------------------------------------------------------- */
+
+/* Light mode -- default (no attribute required) */
+:root,
+[data-theme='light'] {
+  --color-bg:           #F2F4FF;
+  --color-surface:      #FFFFFF;
+  --color-border:       #C8CCDE;
+  /* #0077AA on white: ~4.9:1 contrast ratio -- passes WCAG AA */
+  --color-accent:       #0077AA;
+  --color-accent-dim:   #005580;
+  --color-text-primary: #0A0A1A;
+  --color-text-secondary: #44556A;
+  /* Text colour on top of --color-accent background */
+  --color-accent-text:  #FFFFFF;
+
+  /* RGB channels for rgba() usage in gradients, glows, and tints */
+  --color-accent-r: 0;
+  --color-accent-g: 119;
+  --color-accent-b: 170;
+}
+
+/* Dark mode */
+[data-theme='dark'] {
+  --color-bg:           #0A0A0F;
+  --color-surface:      #12121A;
+  --color-border:       #1E1E2E;
+  --color-accent:       #00D4FF;
+  --color-accent-dim:   #0099BB;
+  --color-text-primary: #F0F0F0;
+  --color-text-secondary: #8888AA;
+  --color-accent-text:  #000000;
+
+  --color-accent-r: 0;
+  --color-accent-g: 212;
+  --color-accent-b: 255;
+}
+
+/* -------------------------------------------------------------------------
+   Base layer resets and typography
+   ---------------------------------------------------------------------- */
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    border-color: var(--color-border);
+  }
+
+  html {
+    background-color: var(--color-bg);
+    color: var(--color-text-primary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    min-height: 100vh;
+    font-family: var(--font-inter, system-ui, sans-serif);
+  }
+
+  ::selection {
+    background-color: rgba(
+      var(--color-accent-r),
+      var(--color-accent-g),
+      var(--color-accent-b),
+      0.15
+    );
+    color: var(--color-text-primary);
+  }
+
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track  { background: var(--color-bg); }
+  ::-webkit-scrollbar-thumb  { background: var(--color-border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--color-text-secondary); }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    color: var(--color-text-primary);
+    line-height: 1.2;
+    letter-spacing: -0.02em;
+  }
+
+  a { color: var(--color-accent); text-decoration: none; }
+  a:hover { color: var(--color-accent-dim); }
+}
+
+/* -------------------------------------------------------------------------
+   Component layer
+   ---------------------------------------------------------------------- */
+@layer components {
+  .card {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 1.5rem;
+  }
+
+  /* btn-accent text colour switches between themes via --color-accent-text:
+     dark mode: #000 on #00D4FF  (cyan, high contrast)
+     light mode: #FFF on #0077AA (dark blue, passes WCAG AA)              */
+  .btn-accent {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    background-color: var(--color-accent);
+    color: var(--color-accent-text);
+    font-weight: 600;
+    font-size: 0.875rem;
+    letter-spacing: 0.01em;
+    padding: 0.625rem 1.5rem;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    transition: background-color 0.15s ease, transform 0.1s ease;
+  }
+  .btn-accent:hover  { background-color: var(--color-accent-dim); }
+  .btn-accent:active { transform: scale(0.97); }
+  .btn-accent:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    background: transparent;
+    color: var(--color-text-secondary);
+    font-weight: 500;
+    font-size: 0.875rem;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--color-border);
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  .btn-ghost:hover {
+    color: var(--color-text-primary);
+    border-color: var(--color-text-secondary);
+  }
+
+  .metric-label {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-text-secondary);
+  }
+
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      var(--color-surface) 25%,
+      var(--color-border) 50%,
+      var(--color-surface) 75%
+    );
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.4s ease-in-out infinite;
+    border-radius: 6px;
+  }
+}
+
+@layer utilities {
+  .text-gradient-accent {
+    background: linear-gradient(
+      135deg,
+      var(--color-accent) 0%,
+      var(--color-accent-dim) 100%
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .glow-accent {
+    box-shadow: 0 0 20px rgba(
+      var(--color-accent-r),
+      var(--color-accent-g),
+      var(--color-accent-b),
+      0.30
+    );
+  }
+
+  .surface-highlight {
+    background: linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.03) 0%,
+      transparent 60%
+    );
+  }
+}
+
+@keyframes skeleton-shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+
+/* -------------------------------------------------------------------------
+   Page-level grid overlay used by the landing page fixed background layer.
+   CSS custom properties cannot be used inside background-image gradient
+   alpha values, so we define the grid colours directly per theme.
+   ---------------------------------------------------------------------- */
+.bg-grid {
+  /* Light mode default: slate blue at 3% */
+  background-image:
+    linear-gradient(rgba(74,96,128,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(74,96,128,0.03) 1px, transparent 1px);
+  background-size: 52px 52px;
+}
+
+[data-theme='dark'] .bg-grid {
+  /* Dark mode: white at 5% */
+  background-image:
+    linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
+}

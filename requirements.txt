@@ -1,0 +1,17 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+asyncpg==0.30.0
+pgvector==0.4.0
+rank-bm25==0.2.2
+openai==1.78.1
+anthropic==0.52.0
+httpx==0.28.1
+ragas==0.1.21
+langsmith==0.3.42
+pydantic-settings==2.9.1
+python-dotenv==1.1.0
+pytest==8.3.5
+pytest-asyncio==0.26.0
+python-multipart==0.0.27
+pypdf==5.1.0
+datasets==4.8.5
