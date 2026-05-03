@@ -26,6 +26,7 @@ installed. Tests mock _run_ragas() directly and never trigger the lazy imports.
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from typing import Optional
@@ -36,6 +37,8 @@ from backend.llm.openai_provider import OpenAIProvider
 from backend.retrieval.base import RetrievalResult
 from backend.retrieval.registry import registry as retrieval_registry
 from backend.retrieval.contextual_compression import ContextualCompressor
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -243,26 +246,41 @@ def run_evaluation(
     corpus_hash : str
         Hash identifying the corpus, stored for provenance.
     """
-    # Force the standard asyncio event loop policy for this background thread.
-    # uvicorn installs uvloop as the default policy, but RAGAS uses nest_asyncio
-    # internally which cannot patch uvloop. This only affects the background
-    # thread -- the main FastAPI event loop continues using uvloop.
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-
-    asyncio.run(
-        _run_evaluation_async(
-            run_id=run_id,
-            retrieval_strategy=retrieval_strategy,
-            chunker_strategy=chunker_strategy,
-            retrieval_params=retrieval_params,
-            chunker_params=chunker_params,
-            compression_enabled=compression_enabled,
-            compression_params=compression_params,
-            corpus=corpus,
-            question=question,
-            corpus_hash=corpus_hash,
-        )
+    logger.info(
+        "run_evaluation: starting run_id=%s strategy=%s",
+        run_id,
+        retrieval_strategy,
     )
+    try:
+        # Force the standard asyncio event loop policy for this background thread.
+        # uvicorn installs uvloop as the default policy, but RAGAS uses nest_asyncio
+        # internally which cannot patch uvloop. This only affects the background
+        # thread -- the main FastAPI event loop continues using uvloop.
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
+        asyncio.run(
+            _run_evaluation_async(
+                run_id=run_id,
+                retrieval_strategy=retrieval_strategy,
+                chunker_strategy=chunker_strategy,
+                retrieval_params=retrieval_params,
+                chunker_params=chunker_params,
+                compression_enabled=compression_enabled,
+                compression_params=compression_params,
+                corpus=corpus,
+                question=question,
+                corpus_hash=corpus_hash,
+            )
+        )
+    except BaseException as exc:
+        # _run_evaluation_async writes status='failed' and returns normally.
+        # This outer handler catches anything that still escapes (e.g. an
+        # error inside the async error handler itself). FastAPI's BackgroundTasks
+        # runner silently swallows exceptions from background callables, so we
+        # must log here or the crash is invisible in production logs.
+        logger.exception(
+            "run_evaluation: unhandled crash for run_id=%s: %s", run_id, exc
+        )
 
 
 async def _run_evaluation_async(
@@ -299,11 +317,16 @@ async def _run_evaluation_async(
 
     Parameters match run_evaluation() exactly.
     """
-    pool = await make_task_pool()
+    pool = None
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
 
     try:
+        # Pool creation is inside the try block so that a DB connection failure
+        # is caught and written as status='failed', rather than propagating out
+        # through asyncio.run() and leaving the row permanently stuck in 'pending'.
+        pool = await make_task_pool()
+
         # Step 1: mark the run as in-progress so the frontend stops showing "pending".
         async with pool.acquire() as conn:
             await conn.execute(
@@ -375,12 +398,19 @@ async def _run_evaluation_async(
                 run_uuid,
             )
 
-    except Exception as exc:
-        # Best-effort: write the failure reason to the database. If this write
-        # also fails (e.g. database is unreachable), swallow that too -- there
-        # is nothing more we can do, and re-raising would crash the background
-        # task with no visible effect on the user.
+    except BaseException as exc:
+        # Catch BaseException (not just Exception) so that SystemExit,
+        # KeyboardInterrupt, and GeneratorExit are also handled and always
+        # result in a 'failed' row rather than a permanently stuck run.
+        logger.exception(
+            "_run_evaluation_async: run_id=%s failed: %s", run_id, exc
+        )
         try:
+            # If pool creation was what failed, try to open a fresh connection
+            # just to write the failure status. If this also fails, log it and
+            # give up -- there is nothing more we can do from a background thread.
+            if pool is None:
+                pool = await make_task_pool()
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -393,10 +423,15 @@ async def _run_evaluation_async(
                     run_uuid,
                 )
         except Exception:
-            pass
+            logger.exception(
+                "_run_evaluation_async: could not write failed status to DB"
+                " for run_id=%s",
+                run_id,
+            )
 
     finally:
-        await pool.close()
+        if pool is not None:
+            await pool.close()
 
 
 async def get_run(run_id: str) -> Optional[dict]:
