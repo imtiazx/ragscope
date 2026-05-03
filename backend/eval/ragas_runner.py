@@ -246,6 +246,7 @@ def run_evaluation(
     corpus_hash : str
         Hash identifying the corpus, stored for provenance.
     """
+    print(f"[DEBUG] run_evaluation entered run_id={run_id}", flush=True)
     logger.info(
         "run_evaluation: starting run_id=%s strategy=%s",
         run_id,
@@ -278,6 +279,7 @@ def run_evaluation(
         # error inside the async error handler itself). FastAPI's BackgroundTasks
         # runner silently swallows exceptions from background callables, so we
         # must log here or the crash is invisible in production logs.
+        print(f"[DEBUG] run_evaluation CRASHED: {exc}", flush=True)
         logger.exception(
             "run_evaluation: unhandled crash for run_id=%s: %s", run_id, exc
         )
