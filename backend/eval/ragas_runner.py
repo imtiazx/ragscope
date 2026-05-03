@@ -243,6 +243,12 @@ def run_evaluation(
     corpus_hash : str
         Hash identifying the corpus, stored for provenance.
     """
+    # Force the standard asyncio event loop policy for this background thread.
+    # uvicorn installs uvloop as the default policy, but RAGAS uses nest_asyncio
+    # internally which cannot patch uvloop. This only affects the background
+    # thread -- the main FastAPI event loop continues using uvloop.
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
     asyncio.run(
         _run_evaluation_async(
             run_id=run_id,
