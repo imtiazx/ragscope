@@ -90,8 +90,10 @@ async def _run_ragas(
 
     Imports RAGAS and its datasets dependency lazily so this module is
     importable without those packages installed (tests mock this function).
-    The synchronous RAGAS evaluate() call is dispatched to a thread pool via
-    asyncio.to_thread so it does not block the event loop.
+    ragas_evaluate() is called synchronously because this function is only
+    ever reached from _run_evaluation_async, which itself runs inside
+    asyncio.run() in a dedicated background thread with no other coroutines
+    competing on its event loop.
 
     The OpenAI API key is written to os.environ here because RAGAS reads it
     via its langchain dependency. This is the only place in the codebase that
@@ -136,8 +138,15 @@ async def _run_ragas(
         "contexts": [contexts],
     })
 
-    # ragas_evaluate is synchronous; run it in a thread so it does not block
-    # the FastAPI event loop while it makes multiple LLM judge API calls.
+    # Call ragas_evaluate synchronously. asyncio.to_thread() was previously
+    # used here to avoid blocking the FastAPI main event loop, but run_evaluation
+    # now drives _run_evaluation_async via asyncio.run() in a dedicated background
+    # thread -- so this event loop has no other coroutines to starve. Dispatching
+    # to a second thread via asyncio.to_thread() creates a new worker thread with
+    # no event loop; RAGAS and its langchain/nest_asyncio internals call
+    # asyncio.get_event_loop() from that thread, which raises RuntimeError on
+    # Python 3.12+. Calling synchronously keeps everything on the same thread
+    # where asyncio.run() has already set up the event loop.
     def _sync_eval():
         return ragas_evaluate(
             dataset,
@@ -148,7 +157,7 @@ async def _run_ragas(
             ],
         )
 
-    result = await asyncio.to_thread(_sync_eval)
+    result = _sync_eval()
 
     return {
         "faithfulness": float(result["faithfulness"]),
