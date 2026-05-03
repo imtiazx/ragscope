@@ -73,11 +73,26 @@ export interface RunStatusResponse {
 // Base fetch with error handling
 // ---------------------------------------------------------------------------
 
+function getDevTokenHeader(): Record<string, string> {
+  try {
+    const token = sessionStorage.getItem('ragscope_dev_token')
+    if (token) return { 'X-Dev-Token': token }
+  } catch {
+    // sessionStorage unavailable (SSR, private mode) -- omit the header silently
+  }
+  return {}
+}
+
 async function apiFetch<T>(
   path: string,
   options?: RequestInit
 ): Promise<T> {
-  const res = await fetch(`/api${path}`, options)
+  const existing = (options?.headers ?? {}) as Record<string, string>
+  const merged: RequestInit = {
+    ...options,
+    headers: { ...existing, ...getDevTokenHeader() },
+  }
+  const res = await fetch(`/api${path}`, merged)
   if (!res.ok) {
     let detail = `HTTP ${res.status}`
     try {

@@ -1,19 +1,25 @@
 """
 Developer access authentication for RAGScope.
 
-Implements the Tier 0 dev token bypass described in CLAUDE.md. Developers
-place the SHA-256 hash of their DEV_TOKEN in the URL parameter ?dev=<hash>.
-The frontend stores this hash in sessionStorage and sends it on every request
-as the X-Dev-Token header. The backend validates by hashing the received value
-and comparing it against the hash of settings.dev_token.
+Implements the Tier 0 dev token bypass described in CLAUDE.md.
 
-Why this design keeps the raw token out of the browser:
-- The URL contains only the hash, not the raw token.
-- The JS bundle never hardcodes anything -- it reads the hash from the URL at
-  runtime and forwards it in a header.
-- Even if the hash leaks (browser history, logs, network capture), an attacker
-  cannot recover the raw token from a SHA-256 hash.
+Flow:
+  1. Developer visits /app?dev=<raw_token> (e.g. ?dev=imtiazx).
+  2. The frontend reads the value from the URL param on mount and writes it to
+     sessionStorage under the key 'ragscope_dev_token'.
+  3. apiFetch() reads that key and attaches it as the X-Dev-Token request header
+     on every API call for the lifetime of the tab.
+  4. The backend hashes the received header value with SHA-256 and compares it
+     to sha256(settings.dev_token). If they match, all rate limits are bypassed.
+
+Why hashing on both sides:
+- The raw token never appears in server logs (the header value is hashed before
+  any comparison, not compared as plaintext).
+- hmac.compare_digest is used instead of == to prevent timing attacks.
 - The backend never logs or stores the received header value.
+
+The raw token does appear in the browser's URL bar on first visit. Developers
+should navigate away or use a clean URL after the token is in sessionStorage.
 """
 
 import hashlib

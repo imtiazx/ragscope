@@ -37,6 +37,20 @@ function AppShellInner() {
   const [showTierModal, setShowTierModal] = useState(false)
 
   useEffect(() => {
+    // Persist the dev token from ?dev=<token> into sessionStorage so apiFetch
+    // can include it as X-Dev-Token on every request. sessionStorage scope is
+    // intentional: the token clears when the tab closes, matching the CLAUDE.md
+    // spec that says it is stored in sessionStorage, not localStorage.
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const devParam = params.get('dev')
+      if (devParam) {
+        sessionStorage.setItem('ragscope_dev_token', devParam)
+      }
+    } catch {
+      // sessionStorage unavailable (private mode) -- dev access simply won't work
+    }
+
     try {
       const dismissed = localStorage.getItem(DISMISS_KEY) === 'true'
       if (!dismissed) setShowTierModal(true)
