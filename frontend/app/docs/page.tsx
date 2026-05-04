@@ -32,7 +32,7 @@ import {
 const SECTIONS = [
   { id: 'what-is',     label: 'What is RAGScope'          },
   { id: 'how-it-works',label: 'How it works'              },
-  { id: 'strategies',  label: 'The five strategies'       },
+  { id: 'strategies',  label: 'Retrieval strategies'      },
   { id: 'metrics',     label: 'Understanding metrics'     },
   { id: 'tiers',       label: 'Access tiers'              },
   { id: 'faq',         label: 'FAQ'                       },
@@ -143,7 +143,7 @@ function Prose({ children }: { children: React.ReactNode }) {
 // Strategy cards
 // ---------------------------------------------------------------------------
 
-const STRATEGIES = [
+const RETRIEVAL_METHODS = [
   {
     name:       'Naive RAG',
     badge:      'Baseline',
@@ -180,15 +180,6 @@ const STRATEGIES = [
     llmCalls:   '1 (embed)',
     latency:    'Fast to Moderate',
   },
-  {
-    name:       'Contextual Compression',
-    badge:      'Post-processor',
-    badgeColor: 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.15)',
-    when:       'Corpus chunks are long and contain many irrelevant sentences alongside the relevant ones.',
-    avoid:      'Short chunks or when every part of a chunk is relevant to the question.',
-    llmCalls:   '1 per chunk (complete)',
-    latency:    'Slow (scales with k)',
-  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -198,7 +189,23 @@ const STRATEGIES = [
 const FAQ = [
   {
     q: 'How does RAGScope differ from a standalone RAGAS evaluation script?',
-    a: 'RAGScope is a comparative harness, not just a scorer. You run multiple strategies against the same question and corpus in one session and see the ranked result. A standalone RAGAS script gives you a score for one pipeline run. RAGScope gives you the number for all five and a visual comparison.',
+    a: 'RAGScope is a comparative harness, not just a scorer. You run multiple retrieval strategies against the same question and corpus in one session and see the ranked result. A standalone RAGAS script gives you a score for one pipeline run. RAGScope gives you scores for all four retrieval methods and a visual comparison.',
+  },
+  {
+    q: 'How many benchmark runs do I get as a guest?',
+    a: 'Guest users receive 12 strategy runs per day, reset at midnight UTC. Selecting all 4 retrieval strategies in one submission counts as 4 runs. Enabling or disabling contextual compression does not count as a run and does not affect this limit.',
+  },
+  {
+    q: 'How many live chat questions do I get as a guest?',
+    a: '5 chat questions per day across all strategies combined, reset at midnight UTC. This is a separate limit from benchmark runs. Add your own API key to remove both limits.',
+  },
+  {
+    q: 'Does enabling contextual compression count as an extra run?',
+    a: 'No. Contextual compression is a post-retrieval processor, not a retrieval method. Toggling it on or off does not consume a run and does not affect the guest daily limit.',
+  },
+  {
+    q: 'Is contextual compression a fifth retrieval strategy?',
+    a: 'No. There are exactly 4 retrieval methods: Naive RAG, HyDE, Multi-Query, and Hybrid BM25+Dense. Contextual compression is a separate orthogonal post-retrieval step that can be applied on top of any of those 4 methods. It is not in the retrieval registry and does not appear alongside the 4 methods in benchmarking.',
   },
   {
     q: 'Does RAGScope store my uploaded documents?',
@@ -206,7 +213,7 @@ const FAQ = [
   },
   {
     q: 'What API key is used for guest evaluation runs?',
-    a: 'Guest runs use a shared OpenAI API key provisioned for the RAGScope service. The key is never exposed to the browser. Guest users are limited to 3 benchmark runs per day to protect the shared quota.',
+    a: 'Guest runs use a shared OpenAI API key provisioned for the RAGScope service. The key is never exposed to the browser. Guest users are limited to 12 strategy runs per day to protect the shared quota.',
   },
   {
     q: 'Can I add a new retrieval strategy without changing the backend?',
@@ -371,48 +378,61 @@ export default function DocsPage() {
           <section className="mb-16" aria-labelledby="how-it-works">
             <SectionHeading id="how-it-works">How it works</SectionHeading>
             <Prose>
-              RAGScope has two phases. The ingest phase processes your documents once. The
-              benchmark phase runs your question through a retrieval strategy and evaluates
-              the result.
+              RAGScope has three phases. The ingest phase processes your documents once. The
+              benchmark phase runs your question through one or more retrieval strategies and
+              evaluates the results. The live chat phase lets you query the corpus interactively
+              using any strategy.
             </Prose>
 
             <div className="flex flex-col gap-5 my-8">
-              <FlowDiagram steps={INGEST_STEPS} label="Phase 1 -- Ingest" />
-              <FlowDiagram steps={BENCHMARK_STEPS} label="Phase 2 -- Benchmark" />
+              <FlowDiagram steps={INGEST_STEPS} label="Phase 1 - Ingest" />
+              <FlowDiagram steps={BENCHMARK_STEPS} label="Phase 2 - Benchmark" />
             </div>
 
-            <SubHeading>Ingest phase</SubHeading>
+            <SubHeading>Phase 1: Ingest</SubHeading>
             <Prose>
               Your uploaded files are passed to the appropriate ingestor (PDF or plain text),
               which extracts raw text. The text is split into chunks by the chunker strategy
               you choose. Each chunk is embedded using OpenAI text-embedding-3-small and stored
-              in a pgvector index alongside the original text. This happens once per corpus.
+              in a pgvector index alongside the original text. A BM25 sparse index is also built
+              over the same chunks for hybrid retrieval. This happens once per corpus.
               Re-uploading the same files returns the cached result immediately.
             </Prose>
 
-            <SubHeading>Benchmark phase</SubHeading>
+            <SubHeading>Phase 2: Benchmark</SubHeading>
             <Prose>
-              You submit a question and select a retrieval strategy. The strategy searches the
-              pgvector index for the most relevant chunks. Those chunks are passed to GPT-4o-mini
-              which generates an answer constrained to the retrieved context. RAGAS then evaluates
-              the question, answer, and context together and produces three scores. The entire
-              process runs as a FastAPI background task so the HTTP response returns immediately
-              with a run ID that you poll until results are ready.
+              You submit a question and select one or more retrieval strategies. Each strategy
+              searches the pgvector index for the most relevant chunks, optionally applies
+              contextual compression, then passes the chunks to GPT-4o-mini which generates
+              an answer constrained to the retrieved context. RAGAS evaluates the question,
+              answer, and context together and produces three scores. Each strategy runs as a
+              separate FastAPI background task so the HTTP response returns immediately with
+              a list of run IDs that you poll independently. Selecting N strategies counts as
+              N runs against the guest daily limit.
+            </Prose>
+
+            <SubHeading>Phase 3: Live chat</SubHeading>
+            <Prose>
+              After benchmarking, you can query your corpus interactively using the winning
+              strategy or any strategy you choose. This is a lightweight retrieval and generation
+              step - not a full-scale chatbot. There is no conversation memory and no multi-turn
+              context: each message is an independent retrieval and generation step using only
+              your question and the retrieved chunks. Use it to explore how different strategies
+              answer follow-up questions on your corpus, not to hold an ongoing dialogue.
             </Prose>
           </section>
 
           {/* ---- Section: Strategies ---- */}
           <section className="mb-16" aria-labelledby="strategies">
-            <SectionHeading id="strategies">The five strategies</SectionHeading>
+            <SectionHeading id="strategies">Retrieval strategies</SectionHeading>
             <Prose>
-              RAGScope benchmarks four retrieval methods and one post-retrieval processor.
-              The methods differ in how they find chunks. The processor changes what happens
-              to chunks after they are found. The processor can be combined with any of the
-              four methods.
+              RAGScope benchmarks four retrieval methods. Each method is a distinct approach
+              to finding relevant chunks from your corpus. They differ in how the query is
+              constructed and how chunks are ranked.
             </Prose>
 
             <div className="flex flex-col gap-5 mt-8">
-              {STRATEGIES.map(s => (
+              {RETRIEVAL_METHODS.map(s => (
                 <div
                   key={s.name}
                   className="rounded-xl p-5"
@@ -458,6 +478,70 @@ export default function DocsPage() {
                 </div>
               ))}
             </div>
+
+            {/* Contextual compression: visually distinct block, NOT a retrieval method */}
+            <div
+              className="mt-10 rounded-xl overflow-hidden"
+              style={{ border: '2px solid rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.3)' }}
+            >
+              <div
+                className="px-5 py-3 flex items-center gap-3"
+                style={{ background: 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.06)' }}
+              >
+                <span
+                  className="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded"
+                  style={{
+                    background: 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.15)',
+                    color: 'var(--color-accent)',
+                  }}
+                >
+                  Post-retrieval processor
+                </span>
+                <h3 className="text-sm font-bold" style={{ color: 'var(--color-text-primary)' }}>
+                  Contextual Compression
+                </h3>
+              </div>
+              <div className="px-5 py-5" style={{ background: 'var(--color-surface)' }}>
+                <div className="flex flex-col gap-3 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                  <p>
+                    Contextual compression is <strong style={{ color: 'var(--color-text-primary)' }}>not a retrieval method</strong> and
+                    is not in the retrieval registry. It is a post-retrieval processor that runs after
+                    any of the four methods above have selected their chunks.
+                  </p>
+                  <p>
+                    When enabled, each retrieved chunk is passed through GPT-4o-mini, which extracts
+                    only the sentences directly relevant to your question. This reduces noise in the
+                    context window and tends to improve faithfulness scores at the cost of one additional
+                    LLM call per chunk.
+                  </p>
+                  <p>
+                    Contextual compression can be toggled on top of any of the four retrieval methods.
+                    Enabling or disabling it does <strong style={{ color: 'var(--color-text-primary)' }}>not</strong> consume
+                    a benchmark run and does not affect the guest daily limit.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-1">
+                    <div>
+                      <p className="font-semibold mb-1" style={{ color: 'var(--color-text-primary)' }}>Use when</p>
+                      <p>Corpus chunks are long and contain many irrelevant sentences alongside the relevant ones.</p>
+                    </div>
+                    <div>
+                      <p className="font-semibold mb-1" style={{ color: 'var(--color-text-primary)' }}>Avoid when</p>
+                      <p>Short chunks or when every part of a chunk is relevant to the question.</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-6 mt-1">
+                    <span>
+                      <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>LLM calls: </span>
+                      1 per chunk (complete)
+                    </span>
+                    <span>
+                      <span className="font-medium" style={{ color: 'var(--color-text-primary)' }}>Latency: </span>
+                      Slow (scales with k)
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
           </section>
 
           {/* ---- Section: Metrics ---- */}
@@ -474,24 +558,42 @@ export default function DocsPage() {
                 name: 'Faithfulness',
                 definition:
                   'For each claim in the generated answer, RAGAS asks the LLM judge whether it is supported by the retrieved chunks. Faithfulness is the fraction of claims that are supported. A score of 1.0 means the answer contains no statements that go beyond what the retrieved context says.',
+                formula: 'score = supported_statements / total_statements',
+                formulaTerms: [
+                  { term: 'supported_statements', def: 'claims in the answer that can be traced directly to a retrieved chunk' },
+                  { term: 'total_statements', def: 'all distinct factual claims extracted from the generated answer' },
+                ],
                 lowScore:
                   'The model is hallucinating. It is making claims not supported by the retrieved documents. This is the most dangerous failure mode in production RAG.',
                 highScore:
                   'Every statement in the answer is traceable to the retrieved context. The retrieval strategy is doing its job.',
               },
               {
-                name: 'Context Precision',
+                name: 'Context Utilization',
                 definition:
-                  'Measures how much of the retrieved context was actually useful for generating the correct answer. If you retrieved 5 chunks but only 1 was relevant, context precision is low. If all 5 were relevant, it is high.',
+                  'Measures how much of the retrieved context was actually used when generating the answer. If you retrieved 5 chunks but only 1 contributed to the answer, context utilization is low. If all 5 were used, it is high. Unlike context precision, this metric requires no ground-truth reference answer.',
+                formula: 'score = (1/K) × ∑ᵏ=₁ᵂ [precision@k × relevance@k]',
+                formulaTerms: [
+                  { term: 'K', def: 'total number of retrieved chunks' },
+                  { term: 'precision@k', def: 'fraction of the top k chunks that were used in generating the answer' },
+                  { term: 'relevance@k', def: '1 if the chunk at position k was used in the answer, 0 if not (judged by gpt-4o-mini)' },
+                ],
                 lowScore:
-                  'The retriever is returning a lot of noisy, irrelevant content alongside the useful material. The LLM has to read more to find the signal.',
+                  'The retriever is returning chunks the LLM ignored. The context window is noisy and the model had to filter it internally.',
                 highScore:
-                  'The retriever is precise. Almost everything returned was needed to answer the question.',
+                  'Almost everything retrieved was referenced when composing the answer. The retriever is returning exactly what is needed.',
               },
               {
                 name: 'Answer Relevancy',
                 definition:
-                  'Measures whether the answer addresses the question that was actually asked. RAGAS generates several questions from the answer and checks whether they resemble the original question. An answer that is factually correct but off-topic scores low.',
+                  'Measures whether the answer addresses the question that was actually asked. RAGAS generates several synthetic questions from the answer and checks whether they resemble the original question using embedding cosine similarity. An answer that is factually correct but off-topic scores low.',
+                formula: 'score = (1/N) × ∑ᵢ=₁ᵊ cosine_similarity(embed(q), embed(qᵢ))',
+                formulaTerms: [
+                  { term: 'N', def: 'number of synthetic questions generated from the answer (typically 3)' },
+                  { term: 'q', def: 'the original user question' },
+                  { term: 'qᵢ', def: 'the i-th synthetic question generated by gpt-4o-mini from the answer alone' },
+                  { term: 'cosine_similarity', def: 'dot product of two unit-normalised embedding vectors' },
+                ],
                 lowScore:
                   'The answer contains accurate information but does not directly address the question. The model may have retrieved good context but misread the intent.',
                 highScore:
@@ -501,6 +603,23 @@ export default function DocsPage() {
               <div key={m.name} className="mb-8">
                 <SubHeading>{m.name}</SubHeading>
                 <Prose>{m.definition}</Prose>
+
+                {/* Formula block */}
+                <div
+                  className="rounded-lg p-4 mb-4 font-mono text-xs"
+                  style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+                >
+                  <p className="mb-3" style={{ color: 'var(--color-accent)' }}>{m.formula}</p>
+                  <div className="flex flex-col gap-1.5">
+                    {m.formulaTerms.map(({ term, def }) => (
+                      <p key={term} className="font-mono text-[11px]" style={{ color: 'var(--color-text-secondary)' }}>
+                        <span style={{ color: 'var(--color-text-primary)' }}>{term}</span>
+                        {' '}= {def}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div
                     className="rounded-lg p-4 text-xs"
@@ -532,19 +651,19 @@ export default function DocsPage() {
 
             {[
               {
-                label: 'Tier 1 -- Guest',
+                label: 'Tier 1 - Guest',
                 active: true,
                 items: [
-                  '3 benchmark runs per day, reset at midnight UTC',
-                  '3 chat questions per benchmark session',
+                  '12 strategy runs per day, reset at midnight UTC (selecting all 4 strategies counts as 4 runs)',
+                  '5 live chat questions per day across all strategies combined',
                   '10 MB combined corpus upload limit',
                   'Uses the RAGScope shared OpenAI API key',
                   'No account or API key required',
                 ],
-                note: 'The daily limit protects the shared API key quota. It resets every midnight UTC regardless of your local timezone.',
+                note: 'The daily limit protects the shared API key quota. It resets every midnight UTC regardless of your local timezone. Enabling or disabling contextual compression does not count as a run.',
               },
               {
-                label: 'Tier 2 -- BYOK',
+                label: 'Tier 2 - BYOK',
                 active: false,
                 items: [
                   'Unlimited benchmark runs',
@@ -557,7 +676,7 @@ export default function DocsPage() {
                 note: 'To activate BYOK, click the settings icon in the top navigation bar and paste your API key. You can remove it at any time.',
               },
               {
-                label: 'Tier 0 -- Developer',
+                label: 'Tier 0 - Developer',
                 active: false,
                 items: [
                   'Unlimited runs with no rate limiting',

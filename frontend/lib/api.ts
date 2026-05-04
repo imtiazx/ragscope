@@ -46,7 +46,7 @@ export interface IngestResponse {
 }
 
 export interface BenchmarkResponse {
-  run_id: string
+  run_ids: string[]
 }
 
 export interface RunStatusResponse {
@@ -137,18 +137,26 @@ export async function ingestFiles(
 }
 
 /**
- * Create a new benchmark run. Returns immediately with a run_id.
- * Poll GET /results/{run_id} for results.
+ * Strategy configuration for a single retrieval run within a multi-strategy request.
+ * Each item in the strategies list results in one background task and one run_id.
+ */
+export interface StrategyConfig {
+  strategy: string
+  retrieval_params?: Record<string, unknown>
+  compression_enabled?: boolean
+  compression_params?: Record<string, unknown>
+}
+
+/**
+ * Create one or more benchmark runs (one per strategy). Returns immediately with
+ * a list of run_ids. Poll GET /results/{run_id} for each one independently.
  */
 export async function createBenchmark(payload: {
   corpus_hash: string
   question: string
-  retrieval_strategy: string
-  retrieval_params: Record<string, unknown>
   chunker_strategy: string
   chunker_params: Record<string, unknown>
-  compression_enabled: boolean
-  compression_params: Record<string, unknown>
+  strategies: StrategyConfig[]
 }): Promise<BenchmarkResponse> {
   return apiFetch<BenchmarkResponse>('/benchmark', {
     method: 'POST',

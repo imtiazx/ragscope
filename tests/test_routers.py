@@ -200,23 +200,19 @@ def test_ingest_rejects_unsupported_file_type(client):
 def test_benchmark_returns_404_for_unknown_corpus_hash(client):
     """
     POST /benchmark must return HTTP 404 if the corpus_hash has not been
-    ingested. The client must call POST /ingest first.
+    ingested. The corpus check fires before the rate limit check, so no
+    rate limit mocks are needed -- the 404 is returned first.
     """
     with patch("backend.routers.benchmark.corpus_exists",
-               new_callable=AsyncMock) as mock_exists, \
-         patch("backend.core.rate_limiter.get_run_count",
-               new_callable=AsyncMock) as mock_count, \
-         patch("backend.core.rate_limiter.increment_run_count",
-               new_callable=AsyncMock):
+               new_callable=AsyncMock) as mock_exists:
         mock_exists.return_value = False
-        mock_count.return_value = 0
 
         response = client.post(
             "/benchmark",
             json={
                 "corpus_hash": "nonexistent_hash",
                 "question": "What is the answer?",
-                "retrieval_strategy": "naive",
+                "strategies": [{"strategy": "naive"}],
             },
         )
 
@@ -226,24 +222,21 @@ def test_benchmark_returns_404_for_unknown_corpus_hash(client):
 
 def test_benchmark_returns_400_for_unknown_retrieval_strategy(client):
     """
-    POST /benchmark must return HTTP 400 if retrieval_strategy is not in the
-    retrieval registry. The 400 must be returned before any DB write occurs.
+    POST /benchmark must return HTTP 400 if any strategy in the list is not
+    in the retrieval registry. The 400 must be returned before any DB write.
+    Strategy validation happens before the rate limit check, so only the
+    corpus mock is required.
     """
     with patch("backend.routers.benchmark.corpus_exists",
-               new_callable=AsyncMock) as mock_exists, \
-         patch("backend.core.rate_limiter.get_run_count",
-               new_callable=AsyncMock) as mock_count, \
-         patch("backend.core.rate_limiter.increment_run_count",
-               new_callable=AsyncMock):
+               new_callable=AsyncMock) as mock_exists:
         mock_exists.return_value = True  # corpus exists, strategy is the problem
-        mock_count.return_value = 0
 
         response = client.post(
             "/benchmark",
             json={
                 "corpus_hash": "abc123",
                 "question": "What is the answer?",
-                "retrieval_strategy": "totally_unknown_strategy",
+                "strategies": [{"strategy": "totally_unknown_strategy"}],
             },
         )
 
@@ -251,14 +244,14 @@ def test_benchmark_returns_400_for_unknown_retrieval_strategy(client):
     assert "totally_unknown_strategy" in response.json()["detail"]
 
 
-def test_benchmark_returns_202_and_run_id_on_success(client):
+def test_benchmark_returns_202_and_run_ids_on_success(client):
     """
-    POST /benchmark must return HTTP 202 with a run_id UUID string when all
-    inputs are valid. The background task must be registered but not awaited
-    during the request (run_evaluation is mocked to a no-op).
+    POST /benchmark must return HTTP 202 with a run_ids list when all inputs
+    are valid. Each strategy in the list gets its own run_id. The background
+    task is registered but not awaited (run_evaluation is mocked to a no-op).
 
-    check_rate_limit's DB calls (get_run_count, increment_run_count) are also
-    mocked so the rate limiter passes without a real database connection.
+    get_run_count and increment_run_count are patched at the benchmark module
+    level so the test runs without a real database connection.
     """
     run_uuid = uuid.UUID("a7f3c2d1-1234-5678-9abc-def012345678")
     mock_conn = _MockConn(fetchrow_result={"id": run_uuid})
@@ -270,11 +263,10 @@ def test_benchmark_returns_202_and_run_id_on_success(client):
                new_callable=AsyncMock) as mock_gp, \
          patch("backend.routers.benchmark.load_corpus",
                new_callable=AsyncMock) as mock_corpus, \
-         patch("backend.routers.benchmark.run_evaluation",
-               new_callable=AsyncMock), \
-         patch("backend.core.rate_limiter.get_run_count",
+         patch("backend.routers.benchmark.run_evaluation"), \
+         patch("backend.routers.benchmark.get_run_count",
                new_callable=AsyncMock) as mock_count, \
-         patch("backend.core.rate_limiter.increment_run_count",
+         patch("backend.routers.benchmark.increment_run_count",
                new_callable=AsyncMock):
 
         mock_exists.return_value = True
@@ -287,15 +279,18 @@ def test_benchmark_returns_202_and_run_id_on_success(client):
             json={
                 "corpus_hash": "abc123",
                 "question": "What is the answer?",
-                "retrieval_strategy": "naive",
-                "retrieval_params": {"top_k": 3},
+                "strategies": [
+                    {"strategy": "naive", "retrieval_params": {"top_k": 3}},
+                ],
             },
         )
 
     assert response.status_code == 202
     body = response.json()
-    assert "run_id" in body
-    assert body["run_id"] == str(run_uuid)
+    assert "run_ids" in body
+    assert isinstance(body["run_ids"], list)
+    assert len(body["run_ids"]) == 1
+    assert body["run_ids"][0] == str(run_uuid)
 
 
 # ---------------------------------------------------------------------------

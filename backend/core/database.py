@@ -361,14 +361,14 @@ async def load_corpus(corpus_hash: str) -> list[dict]:
     ]
 
 
-async def increment_run_count(fingerprint_hash: str) -> None:
+async def increment_run_count(fingerprint_hash: str, delta: int = 1) -> None:
     """
     Increment the benchmark run counter for today for the given fingerprint.
 
     Uses INSERT ... ON CONFLICT DO UPDATE so the operation is atomic and
     requires no separate existence check. If no row exists for this
-    fingerprint and today's date, a new row is created with run_count=1.
-    If a row already exists, its run_count is incremented by 1.
+    fingerprint and today's date, a new row is created with run_count=delta.
+    If a row already exists, its run_count is incremented by delta.
 
     The composite primary key (fingerprint_hash, date) ensures one counter
     row per fingerprint per calendar day. Yesterday's counter rows are never
@@ -378,17 +378,21 @@ async def increment_run_count(fingerprint_hash: str) -> None:
     ----------
     fingerprint_hash : str
         SHA-256 hex digest of the combined IP + browser fingerprint string.
+    delta : int
+        Amount to increment by. Defaults to 1. Pass the number of strategies
+        selected in a multi-strategy benchmark submission.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO rate_limit_counters (fingerprint_hash, date, run_count)
-            VALUES ($1, CURRENT_DATE, 1)
+            VALUES ($1, CURRENT_DATE, $2)
             ON CONFLICT (fingerprint_hash, date)
-            DO UPDATE SET run_count = rate_limit_counters.run_count + 1
+            DO UPDATE SET run_count = rate_limit_counters.run_count + $2
             """,
             fingerprint_hash,
+            delta,
         )
 
 

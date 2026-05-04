@@ -1,7 +1,14 @@
 """
-Rate limiting dependency for RAGScope.
+Rate limiting constants and dependency for RAGScope.
 
-Enforces the Tier 1 guest limit of 3 benchmark runs per day per user.
+Exports DAILY_RUN_LIMIT (12 strategy runs per day) and DAILY_CHAT_LIMIT
+(5 live chat questions per day) for use by the benchmark and chat routers.
+
+The check_rate_limit dependency enforces the run limit as a FastAPI
+dependency. For multi-strategy benchmarks, the benchmark router performs
+the rate limit check inline using DAILY_RUN_LIMIT directly, because it
+needs to calculate N strategies at once before creating any rows.
+
 The "user" is identified by a SHA-256 hash of their IP address combined
 with a browser fingerprint sent in a custom header. This composite identifier
 is more precise than IP alone (multiple users can share one IP) without
@@ -13,7 +20,7 @@ limiter either.
 
 HTTP 429 Too Many Requests is the standard status code for rate limit
 violations. It signals to the client that the request was understood and
-valid, but is being refused temporarily due to rate constraints -- as
+valid, but is being refused temporarily due to rate constraints - as
 opposed to 403 Forbidden which implies a permanent access denial.
 """
 
@@ -24,9 +31,13 @@ from fastapi import Depends, HTTPException, Header, Request
 from backend.core.auth import get_dev_access
 from backend.core.database import get_run_count, increment_run_count
 
-# Maximum number of benchmark runs a guest user may make in one calendar day.
-# Matches the Tier 1 limit defined in CLAUDE.md.
-DAILY_RUN_LIMIT = 3
+# Maximum number of strategy-level benchmark runs a guest user may make per day.
+# Selecting all 4 strategies counts as 4 runs. Matches the Tier 1 limit in CLAUDE.md.
+DAILY_RUN_LIMIT = 12
+
+# Maximum number of live chat questions a guest user may ask per day across all
+# strategies combined. Matches the Tier 1 limit defined in CLAUDE.md.
+DAILY_CHAT_LIMIT = 5
 
 
 async def check_rate_limit(
@@ -94,7 +105,7 @@ async def check_rate_limit(
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Daily limit of {DAILY_RUN_LIMIT} benchmark runs reached. "
+                f"Daily limit of {DAILY_RUN_LIMIT} strategy runs reached. "
                 "Your limit resets at midnight UTC. Paste your own API key "
                 "in Settings to run unlimited benchmarks."
             ),

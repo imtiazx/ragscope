@@ -30,12 +30,15 @@ export const metadata: Metadata = {
     default: 'RAGScope',
     template: '%s | RAGScope',
   },
-  description: 'Ground truth for your retrieval pipeline. Benchmark five RAG strategies head to head using RAGAS metrics.',
+  description: 'Ground truth for your retrieval pipeline. Benchmark four RAG strategies head to head using RAGAS metrics.',
   metadataBase: new URL(process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000'),
   openGraph: {
     title: 'RAGScope',
     description: 'Ground truth for your retrieval pipeline.',
     type: 'website',
+  },
+  icons: {
+    icon: [{ url: '/favicon.svg', type: 'image/svg+xml' }],
   },
 }
 
@@ -53,11 +56,12 @@ export default function RootLayout({
      */
     <html lang="en" suppressHydrationWarning className={inter.variable}>
       <head>
+        <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
         {/*
          * This script runs synchronously before any CSS or React code.
          * It reads the stored theme from localStorage and sets data-theme
          * on <html> immediately, so the correct palette is applied before
-         * the first paint -- no flash of dark-on-light or light-on-dark.
+         * the first paint - no flash of dark-on-light or light-on-dark.
          */}
         <script
           dangerouslySetInnerHTML={{

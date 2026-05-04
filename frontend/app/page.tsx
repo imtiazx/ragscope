@@ -37,13 +37,13 @@ const WHY_ITEMS = [
   },
   {
     number: '02',
-    title: 'Five strategies, one benchmark run',
-    body: 'Naive RAG, HyDE, Multi-Query, Hybrid BM25+Dense, and Contextual Compression. Run them against the same question on the same corpus. See the ranked result. Know which approach fits your data before writing a line of production code.',
+    title: 'Four retrieval strategies, one benchmark run',
+    body: 'Naive RAG, HyDE, Multi-Query, and Hybrid BM25+Dense. Combine any of them with contextual compression as an optional post-retrieval step. Run against the same question on the same corpus. See the ranked result. Know which approach fits your data before writing a line of production code.',
   },
   {
     number: '03',
     title: 'Bring your own key for unlimited runs',
-    body: 'Guest access covers three benchmark runs per day using the shared API key. Paste your own OpenAI or Anthropic key to remove all limits. Your key is read directly from the browser and never forwarded to the backend.',
+    body: 'Guest access covers 12 strategy runs per day using the shared API key. Paste your own OpenAI or Anthropic key to remove all limits. Your key is read directly from the browser and never forwarded to the backend.',
   },
 ]
 
@@ -52,8 +52,8 @@ const WHY_ITEMS = [
 const FEATURES = [
   {
     Icon: BarChart2,
-    title: 'Benchmark 5 strategies head to head',
-    body: 'Upload a corpus, ask a question, and receive a ranked comparison across five retrieval approaches. Radar charts, latency bars, and a sortable comparison table give you the full picture at a glance.',
+    title: 'Benchmark 4 strategies head to head',
+    body: 'Upload a corpus, ask a question, and receive a ranked comparison across four retrieval approaches. Radar charts, latency bars, and a sortable comparison table give you the full picture at a glance.',
   },
   {
     Icon: FlaskConical,
@@ -151,8 +151,8 @@ export default function LandingPage() {
             className="max-w-xl text-base leading-relaxed mb-12"
             style={{ color: 'var(--color-text-secondary)' }}
           >
-            Upload a corpus, run five retrieval strategies, and see ranked scores
-            for faithfulness, context precision, and answer relevancy. Know what
+            Upload a corpus, run four retrieval strategies, and see ranked scores
+            for faithfulness, context utilization, and answer relevancy. Know what
             works on your data before shipping.
           </p>
 
@@ -172,7 +172,7 @@ export default function LandingPage() {
             className="mt-5 text-xs"
             style={{ color: 'var(--color-text-secondary)' }}
           >
-            3 free runs per day as a guest. No account required.
+            12 strategy runs per day - no account required.
           </p>
         </div>
 

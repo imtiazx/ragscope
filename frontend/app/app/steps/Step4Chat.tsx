@@ -38,7 +38,7 @@ import type { RetrieverInfo, ParamSchemaEntry } from '@/lib/api'
 // Constants
 // ---------------------------------------------------------------------------
 
-const GUEST_QUESTION_LIMIT = 3
+const GUEST_QUESTION_LIMIT = 5
 const POLL_MS = 2000
 
 // ---------------------------------------------------------------------------
@@ -214,6 +214,7 @@ export default function Step4Chat() {
 
   const isGuest   = !state.byokKey
   const sessionId = state.runId ?? 'default'
+  const [isDevMode, setIsDevMode] = useState(false)
 
   // Derive winning strategy from run history
   const completed = state.runHistory.filter(r => r.status === 'completed')
@@ -241,10 +242,17 @@ export default function Step4Chat() {
   // Guest question tracking
   const [questionsUsed, setQuestionsUsed] = useState(getChatCount(sessionId))
   const questionsLeft = Math.max(0, GUEST_QUESTION_LIMIT - questionsUsed)
-  const limitReached  = isGuest && questionsLeft === 0
+  const limitReached  = isGuest && !isDevMode && questionsLeft === 0
 
   // Scroll-to-bottom ref
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  // Detect dev mode on mount so counter fetch is skipped entirely in dev mode
+  useEffect(() => {
+    try {
+      setIsDevMode(!!sessionStorage.getItem('ragscope_dev_token'))
+    } catch { /* sessionStorage unavailable */ }
+  }, [])
 
   // Fetch strategies once
   useEffect(() => {
@@ -296,16 +304,21 @@ export default function Step4Chat() {
 
     try {
       // Create a benchmark run for this chat turn
-      const { run_id } = await createBenchmark({
-        corpus_hash:         state.corpusHash,
-        question:            text,
-        retrieval_strategy:  strategy,
-        retrieval_params:    params,
-        chunker_strategy:    state.chunkerStrategy,
-        chunker_params:      state.chunkerParams,
-        compression_enabled: state.compressionEnabled,
-        compression_params:  state.compressionParams,
+      const { run_ids } = await createBenchmark({
+        corpus_hash:      state.corpusHash,
+        question:         text,
+        chunker_strategy: state.chunkerStrategy,
+        chunker_params:   state.chunkerParams,
+        strategies: [
+          {
+            strategy:            strategy,
+            retrieval_params:    params,
+            compression_enabled: state.compressionEnabled,
+            compression_params:  state.compressionParams,
+          },
+        ],
       })
+      const run_id = run_ids[0]
 
       // Poll until done, then replace the thinking placeholder
       const poll = (): Promise<void> =>
@@ -517,24 +530,26 @@ export default function Step4Chat() {
       </div>
 
       {/* ---------------------------------------------------------------- */}
-      {/* Guest question counter                                            */}
+      {/* Question counter: dev mode shows "unlimited", guest shows count  */}
       {/* ---------------------------------------------------------------- */}
-      {isGuest && !limitReached && (
+      {isDevMode ? (
+        <p className="text-[11px] text-center py-1 font-medium" style={{ color: '#14b8a6' }}>
+          Dev mode - unlimited
+        </p>
+      ) : isGuest && !limitReached ? (
         <p
           className="text-[11px] text-center py-1"
           style={{ color: 'var(--color-text-secondary)' }}
           aria-live="polite"
         >
-          {questionsLeft === 1
-            ? '1 question remaining for this run'
-            : `${questionsLeft} questions remaining for this run`}
+          {`${questionsLeft} of ${GUEST_QUESTION_LIMIT} chat questions remaining today`}
         </p>
-      )}
+      ) : null}
 
       {/* ---------------------------------------------------------------- */}
-      {/* Limit reached banner                                              */}
+      {/* Limit reached banner (hidden in dev mode)                         */}
       {/* ---------------------------------------------------------------- */}
-      {limitReached && (
+      {!isDevMode && limitReached && (
         <div
           className="flex items-center gap-3 px-4 py-3 rounded-xl mb-2"
           style={{
@@ -546,7 +561,7 @@ export default function Step4Chat() {
           <Key size={16} style={{ color: 'var(--color-text-secondary)', flexShrink: 0 }} aria-hidden="true" />
           <div className="flex-1 min-w-0">
             <p className="text-xs font-medium" style={{ color: 'var(--color-text-primary)' }}>
-              3 questions used for this run
+              Daily chat limit reached ({GUEST_QUESTION_LIMIT} questions per day)
             </p>
             <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
               Add your own OpenAI or Anthropic key for unlimited chat. Your key

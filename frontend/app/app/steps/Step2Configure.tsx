@@ -24,7 +24,7 @@ import type { RetrieverInfo, ParamSchemaEntry } from '@/lib/api'
 // Constants
 // ---------------------------------------------------------------------------
 
-const DAILY_LIMIT = 3
+const DAILY_LIMIT = 12
 const DAILY_COUNT_KEY  = 'ragscope_daily_count'
 const DAILY_DATE_KEY   = 'ragscope_daily_date'
 
@@ -252,11 +252,15 @@ export default function Step2Configure() {
 
   // Daily counter
   const [dailyCount, setDailyCount] = useState(0)
+  const [isDevMode, setIsDevMode] = useState(false)
   const isGuest = !state.byokKey
   const runsRemaining = Math.max(0, DAILY_LIMIT - dailyCount)
 
   useEffect(() => {
     setDailyCount(getDailyCount())
+    try {
+      setIsDevMode(!!sessionStorage.getItem('ragscope_dev_token'))
+    } catch { /* sessionStorage unavailable */ }
   }, [])
 
   // Fetch strategies on mount
@@ -306,12 +310,16 @@ export default function Step2Configure() {
       const result = await createBenchmark({
         corpus_hash: state.corpusHash,
         question: question.trim(),
-        retrieval_strategy: selectedStrategy,
-        retrieval_params: retrievalParams,
         chunker_strategy: state.chunkerStrategy,
         chunker_params: state.chunkerParams,
-        compression_enabled: compressionEnabled,
-        compression_params: compressionEnabled ? compressionParams : {},
+        strategies: [
+          {
+            strategy: selectedStrategy,
+            retrieval_params: retrievalParams,
+            compression_enabled: compressionEnabled,
+            compression_params: compressionEnabled ? compressionParams : {},
+          },
+        ],
       })
 
       // Persist to context
@@ -320,7 +328,7 @@ export default function Step2Configure() {
       dispatch({ type: 'SET_RETRIEVAL_PARAMS',    payload: retrievalParams    })
       dispatch({ type: 'SET_COMPRESSION_ENABLED', payload: compressionEnabled })
       dispatch({ type: 'SET_COMPRESSION_PARAMS',  payload: compressionParams  })
-      dispatch({ type: 'SET_RUN_ID',              payload: result.run_id      })
+      dispatch({ type: 'SET_RUN_ID',              payload: result.run_ids[0]  })
 
       if (isGuest) {
         incrementDailyCount()
@@ -518,8 +526,12 @@ export default function Step2Configure() {
 
       {/* Run button + guest counter */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-        {/* Guest run counter */}
-        {isGuest && (
+        {/* Run counter: dev mode overrides guest counter */}
+        {isDevMode ? (
+          <p className="text-xs order-2 sm:order-1 font-medium" style={{ color: '#14b8a6' }}>
+            Dev mode - unlimited
+          </p>
+        ) : isGuest ? (
           <p
             className="text-xs order-2 sm:order-1"
             style={{
@@ -529,9 +541,9 @@ export default function Step2Configure() {
           >
             {runsRemaining === 0
               ? 'Daily limit reached. Add an API key for unlimited runs.'
-              : `${runsRemaining} of ${DAILY_LIMIT} runs remaining today`}
+              : `${runsRemaining} of ${DAILY_LIMIT} runs remaining`}
           </p>
-        )}
+        ) : null}
 
         <button
           type="button"
