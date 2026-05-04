@@ -9,6 +9,8 @@ so embed() raises NotImplementedError. API key is always read from the
 central settings object, never from os.environ directly.
 """
 
+import asyncio
+
 import httpx
 
 from backend.core.config import settings
@@ -72,11 +74,17 @@ class AnthropicProvider(BaseLLMProvider):
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{_ANTHROPIC_API_BASE}/messages",
-                headers=headers,
-                json=payload,
+        # timeout=None disables httpx's anyio-based CancelScope which raises
+        # "Timeout should be used inside a task" when called from a plain
+        # asyncio event loop (our background task). asyncio.wait_for provides
+        # equivalent timeout protection using asyncio's native cancellation.
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    f"{_ANTHROPIC_API_BASE}/messages",
+                    headers=headers,
+                    json=payload,
+                ),
                 timeout=30.0,
             )
             response.raise_for_status()

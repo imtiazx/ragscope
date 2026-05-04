@@ -8,6 +8,8 @@ Used for guest-tier retrieval (gpt-4o-mini) and dense embedding generation
 object -- never from os.environ directly.
 """
 
+import asyncio
+
 import httpx
 
 from backend.core.config import settings
@@ -64,15 +66,19 @@ class OpenAIProvider(BaseLLMProvider):
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{_OPENAI_API_BASE}/chat/completions",
-                headers=headers,
-                json=payload,
+        # timeout=None disables httpx's anyio-based CancelScope which raises
+        # "Timeout should be used inside a task" when called from a plain
+        # asyncio event loop (our background task). asyncio.wait_for provides
+        # equivalent timeout protection using asyncio's native cancellation.
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    f"{_OPENAI_API_BASE}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                ),
                 timeout=30.0,
             )
-            # Raise immediately so callers see a clear error instead of a
-            # confusing KeyError when trying to read the response body.
             response.raise_for_status()
 
         data = response.json()
@@ -111,11 +117,13 @@ class OpenAIProvider(BaseLLMProvider):
             "input": text,
         }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{_OPENAI_API_BASE}/embeddings",
-                headers=headers,
-                json=payload,
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    f"{_OPENAI_API_BASE}/embeddings",
+                    headers=headers,
+                    json=payload,
+                ),
                 timeout=30.0,
             )
             response.raise_for_status()
