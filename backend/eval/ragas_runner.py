@@ -165,6 +165,7 @@ async def _run_ragas(
         )
 
     result = _sync_eval()
+    print("[DEBUG] ragas_evaluate() call returned", flush=True)
 
     return {
         "faithfulness": float(result["faithfulness"]),
@@ -262,7 +263,8 @@ def run_evaluation(
         run_id,
         retrieval_strategy,
     )
-    loop = asyncio.DefaultEventLoopPolicy().new_event_loop()
+    policy = asyncio.DefaultEventLoopPolicy()
+    loop = policy.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(
@@ -459,6 +461,7 @@ async def _run_evaluation_async(
     finally:
         if pool is not None:
             await pool.close()
+        print(f"[DEBUG] _run_evaluation_async: finally block done run_id={run_id}", flush=True)
 
 
 async def get_run(run_id: str) -> Optional[dict]:
