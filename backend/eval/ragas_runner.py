@@ -214,7 +214,6 @@ def run_evaluation(
     chunker_params: dict,
     compression_enabled: bool,
     compression_params: dict,
-    corpus: list[dict],
     question: str,
     corpus_hash: str,
 ) -> None:
@@ -227,6 +226,12 @@ def run_evaluation(
     with asyncio.DefaultEventLoopPolicy().new_event_loop(), sets it as the
     current loop for the thread, then calls loop.run_until_complete() to drive
     _run_evaluation_async. The loop is always closed in a finally block.
+
+    The corpus is NOT accepted as an argument. It is fetched from the database
+    inside _run_evaluation_async using the task's own pool. Passing the full
+    corpus (100+ chunks x 1536 floats each) as a thread-boundary argument
+    caused silent hangs on Render's free tier before run_evaluation even began
+    executing, which is why no [DEBUG] print ever appeared in logs.
 
     This pattern avoids two production failures that prior approaches caused:
       - asyncio.run(): "Can't patch loop of type uvloop.Loop" from nest_asyncio
@@ -250,12 +255,11 @@ def run_evaluation(
         Whether to apply ContextualCompressor after retrieval.
     compression_params : dict
         Parameters for ContextualCompressor. Used only if compression_enabled.
-    corpus : list[dict]
-        Pre-embedded chunks with chunk_id, content, and embedding keys.
     question : str
         The benchmark question to answer and evaluate.
     corpus_hash : str
-        Hash identifying the corpus, stored for provenance.
+        SHA-256 hex digest identifying the corpus in corpus_chunks. The task
+        uses this to load the corpus itself from the database.
     """
     print(f"[DEBUG] run_evaluation entered run_id={run_id}", flush=True)
     logger.info(
@@ -276,7 +280,6 @@ def run_evaluation(
                 chunker_params=chunker_params,
                 compression_enabled=compression_enabled,
                 compression_params=compression_params,
-                corpus=corpus,
                 question=question,
                 corpus_hash=corpus_hash,
             )
@@ -302,7 +305,6 @@ async def _run_evaluation_async(
     chunker_params: dict,
     compression_enabled: bool,
     compression_params: dict,
-    corpus: list[dict],
     question: str,
     corpus_hash: str,
 ) -> None:
@@ -323,13 +325,15 @@ async def _run_evaluation_async(
 
     Execution flow:
       1. Set status='running'
-      2. Initialise retriever and run retrieval
-      3. Optionally apply contextual compression
-      4. Generate an answer from retrieved contexts via LLM
-      5. Run RAGAS evaluation for all three metrics
-      6. Write scores, answer, and chunks to the database; set status='completed'
+      2. Load corpus from database using task pool (not passed as argument)
+      3. Initialise retriever and run retrieval
+      4. Optionally apply contextual compression
+      5. Generate an answer from retrieved contexts via LLM
+      6. Run RAGAS evaluation for all three metrics
+      7. Write scores, answer, and chunks to the database; set status='completed'
 
-    Parameters match run_evaluation() exactly.
+    Parameters match run_evaluation() exactly (corpus is omitted from both
+    because it is fetched here from the database rather than passed as an arg).
     """
     pool = None
     t0 = time.perf_counter()
@@ -351,7 +355,33 @@ async def _run_evaluation_async(
             )
         print(f"[DEBUG] status=running run_id={run_id}", flush=True)
 
-        # Step 2: initialise the retriever from the registry using the stored params.
+        # Step 2: load the corpus using the task's own pool. The corpus is never
+        # passed as an argument to this function because serialising 100+ chunks
+        # (each carrying a 1536-float embedding) across the thread boundary caused
+        # silent hangs on Render before run_evaluation even began executing.
+        # database.py's load_corpus() uses get_pool() which returns the singleton
+        # bound to the uvloop event loop - unusable here. Query inline instead.
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, content, embedding
+                FROM corpus_chunks
+                WHERE corpus_hash = $1
+                ORDER BY chunk_index
+                """,
+                corpus_hash,
+            )
+        corpus = [
+            {
+                "chunk_id": str(row["id"]),
+                "content": row["content"],
+                "embedding": list(row["embedding"]),
+            }
+            for row in rows
+        ]
+        print(f"[DEBUG] corpus loaded chunks={len(corpus)} run_id={run_id}", flush=True)
+
+        # Step 3: initialise the retriever from the registry using the stored params.
         # retrieval_params contains top_k plus any strategy-specific parameters.
         # Passing **retrieval_params to the constructor works because every retriever
         # accepts top_k and its own strategy params as constructor kwargs.
@@ -360,7 +390,7 @@ async def _run_evaluation_async(
         top_k = retrieval_params.get("top_k", 5)
         results: list[RetrievalResult] = await retriever.retrieve(question, top_k)
 
-        # Step 3: optionally compress each chunk to only query-relevant sentences.
+        # Step 4: optionally compress each chunk to only query-relevant sentences.
         if compression_enabled:
             compressor = ContextualCompressor(
                 min_relevance_length=compression_params.get("min_relevance_length", 50),
@@ -368,12 +398,12 @@ async def _run_evaluation_async(
             )
             results = await compressor.compress(results, question)
 
-        # Step 4: generate the answer that RAGAS will evaluate.
+        # Step 5: generate the answer that RAGAS will evaluate.
         provider = OpenAIProvider()
         contexts = [r.content for r in results]
         generated_answer = await _generate_answer(question, contexts, provider)
 
-        # Step 5: run RAGAS metric computation via the thread-pool wrapper.
+        # Step 6: run RAGAS metric computation via the thread-pool wrapper.
         scores = await _run_ragas(question, generated_answer, contexts)
         print(f"[DEBUG] RAGAS complete scores={scores} run_id={run_id}", flush=True)
 
@@ -391,7 +421,7 @@ async def _run_evaluation_async(
             for r in results
         ]
 
-        # Step 6 + 7: write everything and mark as completed in a single statement
+        # Step 7: write everything and mark as completed in a single statement
         # so the frontend never sees a partial state where scores are present but
         # status is still 'running'.
         async with pool.acquire() as conn:

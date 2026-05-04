@@ -34,12 +34,17 @@ class _MockConnection:
     Records every execute() call as a (query_string, args_tuple) pair so
     tests can assert on what SQL was sent and with what parameters.
     fetchrow() returns whatever _fetchrow_result is set to.
+    fetch() returns whatever _fetch_result is set to (used for corpus loading).
     """
 
     def __init__(self) -> None:
-        """Initialise with empty call log and no fetchrow result."""
+        """Initialise with empty call log and no fetchrow/fetch results."""
         self.execute_calls: list[tuple[str, tuple]] = []
         self._fetchrow_result = None
+        # Corpus rows returned by the inline SELECT in _run_evaluation_async.
+        # Empty list means retrievers receive an empty corpus, which the mock
+        # retrievers ignore entirely -- acceptable for unit tests.
+        self._fetch_result: list = []
 
     async def execute(self, query: str, *args) -> None:
         """Record the call; do not actually touch a database."""
@@ -48,6 +53,10 @@ class _MockConnection:
     async def fetchrow(self, query: str, *args):
         """Return the pre-configured result dict."""
         return self._fetchrow_result
+
+    async def fetch(self, query: str, *args) -> list:
+        """Return the pre-configured list of rows (used for corpus load)."""
+        return self._fetch_result
 
 
 class _MockAcquireCtx:
@@ -175,7 +184,6 @@ async def test_status_transitions_to_running_then_completed():
             chunker_params={},
             compression_enabled=False,
             compression_params={},
-            corpus=_CORPUS,
             question="What is the answer?",
             corpus_hash="hash123",
         )
@@ -215,7 +223,6 @@ async def test_completed_run_writes_all_metric_fields():
             chunker_params={},
             compression_enabled=False,
             compression_params={},
-            corpus=_CORPUS,
             question="test question",
             corpus_hash="h1",
         )
@@ -262,7 +269,6 @@ async def test_failed_run_sets_status_to_failed():
             chunker_params={},
             compression_enabled=False,
             compression_params={},
-            corpus=_CORPUS,
             question="test question",
             corpus_hash="h1",
         )
@@ -299,7 +305,6 @@ async def test_failed_run_writes_error_message():
             chunker_params={},
             compression_enabled=False,
             compression_params={},
-            corpus=_CORPUS,
             question="test question",
             corpus_hash="h1",
         )
@@ -349,7 +354,6 @@ async def test_run_evaluation_never_raises():
             chunker_params={},
             compression_enabled=False,
             compression_params={},
-            corpus=_CORPUS,
             question="test question",
             corpus_hash="h1",
         )
@@ -386,7 +390,6 @@ async def test_retrieval_failure_is_caught_as_failed():
             chunker_params={},
             compression_enabled=False,
             compression_params={},
-            corpus=_CORPUS,
             question="test question",
             corpus_hash="h1",
         )

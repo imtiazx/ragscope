@@ -261,8 +261,6 @@ def test_benchmark_returns_202_and_run_ids_on_success(client):
                new_callable=AsyncMock) as mock_exists, \
          patch("backend.routers.benchmark.get_pool",
                new_callable=AsyncMock) as mock_gp, \
-         patch("backend.routers.benchmark.load_corpus",
-               new_callable=AsyncMock) as mock_corpus, \
          patch("backend.routers.benchmark.run_evaluation"), \
          patch("backend.routers.benchmark.get_run_count",
                new_callable=AsyncMock) as mock_count, \
@@ -271,7 +269,6 @@ def test_benchmark_returns_202_and_run_ids_on_success(client):
 
         mock_exists.return_value = True
         mock_gp.return_value = mock_pool
-        mock_corpus.return_value = []
         mock_count.return_value = 0  # well under the daily limit
 
         response = client.post(

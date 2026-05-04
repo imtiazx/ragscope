@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.core.auth import get_dev_access
-from backend.core.database import corpus_exists, get_pool, get_run_count, increment_run_count, load_corpus
+from backend.core.database import corpus_exists, get_pool, get_run_count, increment_run_count
 from backend.core.rate_limiter import DAILY_RUN_LIMIT
 from backend.eval.ragas_runner import run_evaluation
 from backend.retrieval.registry import registry as retrieval_registry
@@ -165,10 +165,11 @@ async def create_benchmark(
                 ),
             )
 
-    # Load the corpus once and share it across all strategy tasks.
-    corpus = await load_corpus(body.corpus_hash)
-
     # Create one benchmark_runs row and one background task per strategy.
+    # The corpus is NOT loaded here. Each background task fetches the corpus
+    # from the database using its own pool so that large embedding vectors
+    # (100+ chunks x 1536 floats) are never serialised across a thread boundary
+    # as a task argument, which caused silent hangs on Render's free tier.
     pool = await get_pool()
     run_ids: list[str] = []
 
@@ -206,7 +207,6 @@ async def create_benchmark(
             chunker_params=body.chunker_params,
             compression_enabled=item.compression_enabled,
             compression_params=item.compression_params,
-            corpus=corpus,
             question=body.question,
             corpus_hash=body.corpus_hash,
         )
