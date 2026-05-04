@@ -12,6 +12,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import Nav from '@/components/Nav'
+import Formula from '@/components/Formula'
 import {
   Play,
   ExternalLink,
@@ -384,12 +385,10 @@ export default function DocsPage() {
               using any strategy.
             </Prose>
 
-            <div className="flex flex-col gap-5 my-8">
-              <FlowDiagram steps={INGEST_STEPS} label="Phase 1 - Ingest" />
-              <FlowDiagram steps={BENCHMARK_STEPS} label="Phase 2 - Benchmark" />
-            </div>
-
             <SubHeading>Phase 1: Ingest</SubHeading>
+            <div className="my-4">
+              <FlowDiagram steps={INGEST_STEPS} label="Ingest flow" />
+            </div>
             <Prose>
               Your uploaded files are passed to the appropriate ingestor (PDF or plain text),
               which extracts raw text. The text is split into chunks by the chunker strategy
@@ -400,6 +399,9 @@ export default function DocsPage() {
             </Prose>
 
             <SubHeading>Phase 2: Benchmark</SubHeading>
+            <div className="my-4">
+              <FlowDiagram steps={BENCHMARK_STEPS} label="Benchmark flow" />
+            </div>
             <Prose>
               You submit a question and select one or more retrieval strategies. Each strategy
               searches the pgvector index for the most relevant chunks, optionally applies
@@ -558,10 +560,10 @@ export default function DocsPage() {
                 name: 'Faithfulness',
                 definition:
                   'For each claim in the generated answer, RAGAS asks the LLM judge whether it is supported by the retrieved chunks. Faithfulness is the fraction of claims that are supported. A score of 1.0 means the answer contains no statements that go beyond what the retrieved context says.',
-                formula: 'score = supported_statements / total_statements',
+                latex: String.raw`\text{score} = \dfrac{N_{\text{supported}}}{N_{\text{total}}}`,
                 formulaTerms: [
-                  { term: 'supported_statements', def: 'claims in the answer that can be traced directly to a retrieved chunk' },
-                  { term: 'total_statements', def: 'all distinct factual claims extracted from the generated answer' },
+                  { term: String.raw`N_{\text{supported}}`, def: 'number of answer claims traceable to a retrieved chunk' },
+                  { term: String.raw`N_{\text{total}}`, def: 'total distinct factual claims extracted from the generated answer' },
                 ],
                 lowScore:
                   'The model is hallucinating. It is making claims not supported by the retrieved documents. This is the most dangerous failure mode in production RAG.',
@@ -572,11 +574,11 @@ export default function DocsPage() {
                 name: 'Context Utilization',
                 definition:
                   'Measures how much of the retrieved context was actually used when generating the answer. If you retrieved 5 chunks but only 1 contributed to the answer, context utilization is low. If all 5 were used, it is high. Unlike context precision, this metric requires no ground-truth reference answer.',
-                formula: 'score = (1/K) × ∑ᵏ=₁ᵂ [precision@k × relevance@k]',
+                latex: String.raw`\text{score} = \dfrac{1}{K}\sum_{k=1}^{K} \text{Prec@}k \cdot \text{Rel@}k`,
                 formulaTerms: [
                   { term: 'K', def: 'total number of retrieved chunks' },
-                  { term: 'precision@k', def: 'fraction of the top k chunks that were used in generating the answer' },
-                  { term: 'relevance@k', def: '1 if the chunk at position k was used in the answer, 0 if not (judged by gpt-4o-mini)' },
+                  { term: String.raw`\text{Prec@}k`, def: 'fraction of the top k chunks that were used in generating the answer' },
+                  { term: String.raw`\text{Rel@}k`, def: '1 if the chunk at position k was used in the answer, 0 otherwise (judged by gpt-4o-mini)' },
                 ],
                 lowScore:
                   'The retriever is returning chunks the LLM ignored. The context window is noisy and the model had to filter it internally.',
@@ -587,12 +589,12 @@ export default function DocsPage() {
                 name: 'Answer Relevancy',
                 definition:
                   'Measures whether the answer addresses the question that was actually asked. RAGAS generates several synthetic questions from the answer and checks whether they resemble the original question using embedding cosine similarity. An answer that is factually correct but off-topic scores low.',
-                formula: 'score = (1/N) × ∑ᵢ=₁ᵊ cosine_similarity(embed(q), embed(qᵢ))',
+                latex: String.raw`\text{score} = \dfrac{1}{N}\sum_{i=1}^{N} \cos\!\left(\hat{e}(q),\, \hat{e}(q_i)\right)`,
                 formulaTerms: [
                   { term: 'N', def: 'number of synthetic questions generated from the answer (typically 3)' },
                   { term: 'q', def: 'the original user question' },
-                  { term: 'qᵢ', def: 'the i-th synthetic question generated by gpt-4o-mini from the answer alone' },
-                  { term: 'cosine_similarity', def: 'dot product of two unit-normalised embedding vectors' },
+                  { term: 'q_i', def: 'the i-th synthetic question generated by gpt-4o-mini from the answer alone' },
+                  { term: String.raw`\hat{e}(\cdot)`, def: 'unit-normalised embedding vector; cosine similarity equals their dot product' },
                 ],
                 lowScore:
                   'The answer contains accurate information but does not directly address the question. The model may have retrieved good context but misread the intent.',
@@ -604,18 +606,26 @@ export default function DocsPage() {
                 <SubHeading>{m.name}</SubHeading>
                 <Prose>{m.definition}</Prose>
 
-                {/* Formula block */}
+                {/* LaTeX formula block */}
                 <div
-                  className="rounded-lg p-4 mb-4 font-mono text-xs"
+                  className="rounded-lg px-6 py-5 mb-4 overflow-x-auto"
                   style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
                 >
-                  <p className="mb-3" style={{ color: 'var(--color-accent)' }}>{m.formula}</p>
-                  <div className="flex flex-col gap-1.5">
+                  {/* Centred display-mode formula */}
+                  <div className="flex justify-center mb-4">
+                    <Formula latex={m.latex} block />
+                  </div>
+
+                  {/* Variable definitions */}
+                  <div className="flex flex-col gap-2">
                     {m.formulaTerms.map(({ term, def }) => (
-                      <p key={term} className="font-mono text-[11px]" style={{ color: 'var(--color-text-secondary)' }}>
-                        <span style={{ color: 'var(--color-text-primary)' }}>{term}</span>
-                        {' '}= {def}
-                      </p>
+                      <div key={term} className="flex items-start gap-2 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                        <span className="flex-shrink-0">
+                          <Formula latex={term} />
+                        </span>
+                        <span className="flex-shrink-0" style={{ color: 'var(--color-text-secondary)' }}>=</span>
+                        <span>{def}</span>
+                      </div>
                     ))}
                   </div>
                 </div>

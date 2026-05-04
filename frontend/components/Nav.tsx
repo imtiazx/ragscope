@@ -72,9 +72,9 @@ export default function Nav() {
           className="flex items-center gap-2 group"
           aria-label="RAGScope home"
         >
-          {/* Accent square mark */}
+          {/* Accent circle mark */}
           <span
-            className="w-6 h-6 rounded-sm flex items-center justify-center text-[10px] font-black"
+            className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-black"
             style={{ background: 'var(--color-accent)', color: '#000' }}
             aria-hidden="true"
           >

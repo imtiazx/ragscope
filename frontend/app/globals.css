@@ -2,6 +2,9 @@
 @tailwind components;
 @tailwind utilities;
 
+/* KaTeX math rendering styles */
+@import 'katex/dist/katex.min.css';
+
 /* -------------------------------------------------------------------------
    Design token CSS variables
    Light theme is the default (matches :root / data-theme="light").
