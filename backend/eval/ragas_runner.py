@@ -8,10 +8,14 @@ can poll for them by run_id.
 
 Public entry point: run_evaluation() is a regular (non-async) function.
 FastAPI's BackgroundTasks dispatcher runs non-async callables in a thread pool
-via anyio. That thread has no asyncio event loop, so any awaitable called
-directly from it raises "There is no current event loop in thread". The sync
-wrapper calls asyncio.run(), which creates a fresh event loop for the thread
-and drives the async implementation to completion inside it.
+via anyio. That thread has no asyncio event loop. The sync wrapper creates one
+with asyncio.DefaultEventLoopPolicy().new_event_loop(), sets it as the current
+loop for the thread, and calls loop.run_until_complete() to drive the async
+implementation to completion. The loop is always closed in a finally block.
+
+Never use anyio.run() inside a FastAPI background task thread - it conflicts
+with FastAPI's anyio task scope. Never call nest_asyncio.apply() against a
+uvloop instance.
 
 The async implementation (_run_evaluation_async) creates its own database pool
 via make_task_pool() rather than using the module-level singleton from get_pool().
@@ -95,8 +99,8 @@ async def _run_ragas(
     importable without those packages installed (tests mock this function).
     ragas_evaluate() is called synchronously because this function is only
     ever reached from _run_evaluation_async, which itself runs inside
-    asyncio.run() in a dedicated background thread with no other coroutines
-    competing on its event loop.
+    loop.run_until_complete() in a dedicated background thread with no other
+    coroutines competing on its event loop.
 
     The OpenAI API key is written to os.environ here because RAGAS reads it
     via its langchain dependency. This is the only place in the codebase that
@@ -143,13 +147,13 @@ async def _run_ragas(
 
     # Call ragas_evaluate synchronously. asyncio.to_thread() was previously
     # used here to avoid blocking the FastAPI main event loop, but run_evaluation
-    # now drives _run_evaluation_async via asyncio.run() in a dedicated background
-    # thread -- so this event loop has no other coroutines to starve. Dispatching
-    # to a second thread via asyncio.to_thread() creates a new worker thread with
-    # no event loop; RAGAS and its langchain/nest_asyncio internals call
-    # asyncio.get_event_loop() from that thread, which raises RuntimeError on
-    # Python 3.12+. Calling synchronously keeps everything on the same thread
-    # where asyncio.run() has already set up the event loop.
+    # now drives _run_evaluation_async via loop.run_until_complete() in a
+    # dedicated background thread - so this event loop has no other coroutines
+    # to starve. Dispatching to a second thread via asyncio.to_thread() creates
+    # a new worker thread with no event loop; RAGAS and its langchain/nest_asyncio
+    # internals call asyncio.get_event_loop() from that thread, which raises
+    # RuntimeError on Python 3.12+. Calling synchronously keeps everything on
+    # the same thread where the event loop has already been set up.
     def _sync_eval():
         return ragas_evaluate(
             dataset,
@@ -201,7 +205,7 @@ def _row_to_dict(row) -> dict:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def run_evaluation(
+def run_evaluation(
     run_id: str,
     retrieval_strategy: str,
     chunker_strategy: str,
@@ -214,17 +218,20 @@ async def run_evaluation(
     corpus_hash: str,
 ) -> None:
     """
-    Async entry point registered with FastAPI BackgroundTasks.
+    Sync entry point registered with FastAPI BackgroundTasks.
 
-    Declared async so FastAPI awaits it directly on the main event loop
-    rather than dispatching it to anyio's thread pool. The sync wrapper
-    approach (asyncio.run / anyio.run inside a worker thread) caused two
-    separate production failures:
+    Declared as a plain (non-async) function so FastAPI dispatches it to a
+    worker thread via anyio rather than awaiting it on the main uvloop event
+    loop. The worker thread has no event loop, so this function creates one
+    with asyncio.DefaultEventLoopPolicy().new_event_loop(), sets it as the
+    current loop for the thread, then calls loop.run_until_complete() to drive
+    _run_evaluation_async. The loop is always closed in a finally block.
+
+    This pattern avoids two production failures that prior approaches caused:
       - asyncio.run(): "Can't patch loop of type uvloop.Loop" from nest_asyncio
-      - anyio.run(): "Timeout should be used inside a task" because FastAPI's
-        anyio token on the thread conflicted with a nested anyio.run() call
-
-    Awaiting _run_evaluation_async directly avoids both issues entirely.
+      - anyio.run() inside a background thread: "Timeout should be used inside
+        a task" because FastAPI's anyio token on the thread conflicted with a
+        nested anyio.run() call
 
     Parameters
     ----------
@@ -255,18 +262,22 @@ async def run_evaluation(
         run_id,
         retrieval_strategy,
     )
+    loop = asyncio.DefaultEventLoopPolicy().new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        await _run_evaluation_async(
-            run_id=run_id,
-            retrieval_strategy=retrieval_strategy,
-            chunker_strategy=chunker_strategy,
-            retrieval_params=retrieval_params,
-            chunker_params=chunker_params,
-            compression_enabled=compression_enabled,
-            compression_params=compression_params,
-            corpus=corpus,
-            question=question,
-            corpus_hash=corpus_hash,
+        loop.run_until_complete(
+            _run_evaluation_async(
+                run_id=run_id,
+                retrieval_strategy=retrieval_strategy,
+                chunker_strategy=chunker_strategy,
+                retrieval_params=retrieval_params,
+                chunker_params=chunker_params,
+                compression_enabled=compression_enabled,
+                compression_params=compression_params,
+                corpus=corpus,
+                question=question,
+                corpus_hash=corpus_hash,
+            )
         )
     except BaseException as exc:
         # _run_evaluation_async writes status='failed' and returns normally.
@@ -277,6 +288,8 @@ async def run_evaluation(
         logger.exception(
             "run_evaluation: unhandled crash for run_id=%s: %s", run_id, exc
         )
+    finally:
+        loop.close()
 
 
 async def _run_evaluation_async(
@@ -294,14 +307,17 @@ async def _run_evaluation_async(
     """
     Async implementation of a full benchmark run.
 
-    Called exclusively via run_evaluation() which drives it with asyncio.run().
-    Creates its own database pool via make_task_pool() rather than reusing the
-    module-level singleton from get_pool(). asyncpg pools are bound to the event
-    loop they were created on; the singleton belongs to the FastAPI main event
-    loop and cannot be used from the separate event loop created by asyncio.run().
+    Called exclusively via run_evaluation() which drives it with
+    loop.run_until_complete(). Creates its own database pool via make_task_pool()
+    rather than reusing the module-level singleton from get_pool(). asyncpg pools
+    are bound to the event loop they were created on; the singleton belongs to the
+    FastAPI main event loop and cannot be used from the separate event loop
+    created in the background thread.
 
     NEVER raises an exception -- all failures are caught, written to the database
     as status='failed' with an error_message, and the function returns normally.
+    If pool creation itself failed (pool is None at exception time), the DB update
+    is skipped and the failure is only logged.
 
     Execution flow:
       1. Set status='running'
@@ -320,8 +336,10 @@ async def _run_evaluation_async(
     try:
         # Pool creation is inside the try block so that a DB connection failure
         # is caught and written as status='failed', rather than propagating out
-        # through asyncio.run() and leaving the row permanently stuck in 'pending'.
+        # through loop.run_until_complete() and leaving the row permanently stuck
+        # in 'pending'.
         pool = await make_task_pool()
+        print(f"[DEBUG] pool created run_id={run_id}", flush=True)
 
         # Step 1: mark the run as in-progress so the frontend stops showing "pending".
         async with pool.acquire() as conn:
@@ -329,6 +347,7 @@ async def _run_evaluation_async(
                 "UPDATE benchmark_runs SET status = 'running' WHERE id = $1",
                 run_uuid,
             )
+        print(f"[DEBUG] status=running run_id={run_id}", flush=True)
 
         # Step 2: initialise the retriever from the registry using the stored params.
         # retrieval_params contains top_k plus any strategy-specific parameters.
@@ -354,6 +373,7 @@ async def _run_evaluation_async(
 
         # Step 5: run RAGAS metric computation via the thread-pool wrapper.
         scores = await _run_ragas(question, generated_answer, contexts)
+        print(f"[DEBUG] RAGAS complete scores={scores} run_id={run_id}", flush=True)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -393,37 +413,48 @@ async def _run_evaluation_async(
                 latency_ms,
                 run_uuid,
             )
+        print(f"[DEBUG] status=completed run_id={run_id}", flush=True)
 
     except BaseException as exc:
         # Catch BaseException (not just Exception) so that SystemExit,
         # KeyboardInterrupt, and GeneratorExit are also handled and always
         # result in a 'failed' row rather than a permanently stuck run.
+        print(f"[DEBUG] _run_evaluation_async FAILED run_id={run_id}: {exc}", flush=True)
         logger.exception(
             "_run_evaluation_async: run_id=%s failed: %s", run_id, exc
         )
-        try:
-            # If pool creation was what failed, try to open a fresh connection
-            # just to write the failure status. If this also fails, log it and
-            # give up -- there is nothing more we can do from a background thread.
-            if pool is None:
-                pool = await make_task_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    UPDATE benchmark_runs SET
-                        status        = 'failed',
-                        error_message = $1
-                    WHERE id = $2
-                    """,
-                    str(exc),
-                    run_uuid,
-                )
-        except Exception:
-            logger.exception(
-                "_run_evaluation_async: could not write failed status to DB"
-                " for run_id=%s",
+        if pool is None:
+            # Pool creation itself failed; no DB connection is available to write
+            # the failure status. Log and give up - we cannot do anything else
+            # from a background thread without a pool.
+            print(
+                f"[DEBUG] pool is None for run_id={run_id}, skipping DB failure write",
+                flush=True,
+            )
+            logger.error(
+                "_run_evaluation_async: pool is None for run_id=%s,"
+                " cannot write failed status",
                 run_id,
             )
+        else:
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE benchmark_runs SET
+                            status        = 'failed',
+                            error_message = $1
+                        WHERE id = $2
+                        """,
+                        str(exc),
+                        run_uuid,
+                    )
+            except Exception:
+                logger.exception(
+                    "_run_evaluation_async: could not write failed status to DB"
+                    " for run_id=%s",
+                    run_id,
+                )
 
     finally:
         if pool is not None:
