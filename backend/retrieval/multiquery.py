@@ -12,7 +12,6 @@ One LLM completion call is made to generate all rewordings. Embeddings for
 all rewordings are computed concurrently via asyncio.gather.
 """
 
-import asyncio
 import math
 import re
 import time
@@ -206,21 +205,26 @@ class MultiQueryRetriever(BaseRetriever):
         """
         t0 = time.perf_counter()
 
+        # complete_sync() and embed_sync() use httpx.Client (blocking). This
+        # function runs inside _run_evaluation_async on a plain asyncio event
+        # loop with no anyio task scope; AsyncClient.__aenter__ requires anyio.
         provider = self._provider if self._provider is not None else OpenAIProvider()
 
         # Step 1: generate query variants with one LLM completion call.
         prompt = _build_variant_prompt(query, self.num_variants)
-        raw_response = await provider.complete(prompt)
+        raw_response = provider.complete_sync(prompt)
         variants = _parse_variants(raw_response, self.num_variants)
 
         # Always include the original query so we never regress below Naive.
         all_queries = [query] + variants
 
-        # Step 2: embed all queries concurrently. asyncio.gather fires every
-        # coroutine at once and returns results in the same order as inputs.
-        embeddings: list[list[float]] = await asyncio.gather(
-            *[provider.embed(q) for q in all_queries]
-        )
+        # Step 2: embed all queries sequentially. The original used asyncio.gather
+        # for concurrency, but embed_sync() is blocking so concurrency requires
+        # threads instead. Sequential calls are simpler and acceptable here
+        # because this thread has no other coroutines competing on its event loop.
+        embeddings: list[list[float]] = [
+            provider.embed_sync(q) for q in all_queries
+        ]
 
         # Step 3 + 4: score each corpus chunk against every query embedding.
         # best_scores maps chunk_id -> (best_score_seen, chunk_dict, list_of_matching_variant_queries)

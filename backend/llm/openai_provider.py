@@ -6,9 +6,17 @@ all calls are non-blocking and compatible with the FastAPI async event loop.
 Used for guest-tier retrieval (gpt-4o-mini) and dense embedding generation
 (text-embedding-3-small). API key is always read from the central settings
 object -- never from os.environ directly.
-"""
 
-import asyncio
+Two method variants are provided for every API call:
+  - async complete() / embed(): used by main FastAPI route handlers that run
+    on the anyio-backed uvloop event loop. These use httpx.AsyncClient.
+  - complete_sync() / embed_sync(): used by the background task execution path
+    (inside _run_evaluation_async) which runs on a plain asyncio event loop
+    with no anyio task scope. httpx.AsyncClient.__aenter__ initialises an
+    anyio task scope and raises "Timeout should be used inside a task" the
+    moment it is entered from a non-anyio context. httpx.Client (sync) never
+    touches anyio at all and is safe to call from any thread.
+"""
 
 import httpx
 
@@ -24,10 +32,11 @@ class OpenAIProvider(BaseLLMProvider):
     """
     Concrete LLM provider that calls OpenAI's APIs.
 
-    Implements both complete() (chat completions via gpt-4o-mini) and
-    embed() (dense vectors via text-embedding-3-small). A new httpx
-    AsyncClient is created per call rather than shared, so instances of
-    this class carry no mutable state and are safe to construct anywhere.
+    Implements both complete() / complete_sync() (chat completions via
+    gpt-4o-mini) and embed() / embed_sync() (dense vectors via
+    text-embedding-3-small). A new httpx client is created per call rather
+    than shared, so instances of this class carry no mutable state and are
+    safe to construct anywhere.
     """
 
     name: str = "openai"
@@ -37,10 +46,10 @@ class OpenAIProvider(BaseLLMProvider):
         """
         Send a prompt to gpt-4o-mini and return the completion text.
 
-        Wraps the OpenAI chat completions endpoint. The prompt is sent as a
-        single user message; no system message is added here -- callers are
-        responsible for including any system instructions in the prompt string
-        they pass in.
+        Uses httpx.AsyncClient. Call this from FastAPI route handlers or any
+        code running inside an anyio task scope (i.e. on the main uvloop event
+        loop). Do NOT call this from a background task thread that runs on a
+        plain asyncio event loop -- use complete_sync() instead.
 
         Parameters
         ----------
@@ -66,31 +75,73 @@ class OpenAIProvider(BaseLLMProvider):
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        # timeout=None disables httpx's anyio-based CancelScope which raises
-        # "Timeout should be used inside a task" when called from a plain
-        # asyncio event loop (our background task). asyncio.wait_for provides
-        # equivalent timeout protection using asyncio's native cancellation.
-        async with httpx.AsyncClient(timeout=None) as client:
-            response = await asyncio.wait_for(
-                client.post(
-                    f"{_OPENAI_API_BASE}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                ),
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{_OPENAI_API_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
                 timeout=30.0,
             )
             response.raise_for_status()
 
         data = response.json()
-        # The choices array always has at least one entry when status is 200.
+        return data["choices"][0]["message"]["content"].strip()
+
+    def complete_sync(self, prompt: str) -> str:
+        """
+        Blocking version of complete() for use in background task threads.
+
+        Uses httpx.Client (synchronous) instead of httpx.AsyncClient. This
+        method must be used inside _run_evaluation_async and any code it calls
+        (retrievers, compressor, answer generator) because those run on a plain
+        asyncio.DefaultEventLoopPolicy event loop with no anyio task scope.
+        httpx.AsyncClient.__aenter__ initialises an anyio task scope and raises
+        "Timeout should be used inside a task" immediately when entered from a
+        non-anyio context. httpx.Client never touches anyio.
+
+        Parameters
+        ----------
+        prompt : str
+            Full prompt text to send as the user message.
+
+        Returns
+        -------
+        str
+            The model's reply text, stripped of leading/trailing whitespace.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            If the OpenAI API responds with a 4xx or 5xx status code.
+        """
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        with httpx.Client() as client:
+            response = client.post(
+                f"{_OPENAI_API_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+
+        data = response.json()
         return data["choices"][0]["message"]["content"].strip()
 
     async def embed(self, text: str) -> list[float]:
         """
         Convert text into a dense vector using text-embedding-3-small.
 
-        Calls the OpenAI embeddings endpoint. The returned vector has 1536
-        dimensions and is suitable for cosine similarity search in pgvector.
+        Uses httpx.AsyncClient. Call this from FastAPI route handlers or any
+        code running inside an anyio task scope. Do NOT call this from a
+        background task thread -- use embed_sync() instead.
 
         Parameters
         ----------
@@ -117,18 +168,59 @@ class OpenAIProvider(BaseLLMProvider):
             "input": text,
         }
 
-        async with httpx.AsyncClient(timeout=None) as client:
-            response = await asyncio.wait_for(
-                client.post(
-                    f"{_OPENAI_API_BASE}/embeddings",
-                    headers=headers,
-                    json=payload,
-                ),
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{_OPENAI_API_BASE}/embeddings",
+                headers=headers,
+                json=payload,
                 timeout=30.0,
             )
             response.raise_for_status()
 
         data = response.json()
-        # data["data"] is a list; index 0 holds the embedding for the single
-        # input string we sent.
+        return data["data"][0]["embedding"]
+
+    def embed_sync(self, text: str) -> list[float]:
+        """
+        Blocking version of embed() for use in background task threads.
+
+        Uses httpx.Client (synchronous) instead of httpx.AsyncClient. Must be
+        used inside _run_evaluation_async and any retriever or compressor code
+        running in that context. See complete_sync() docstring for the full
+        explanation of why AsyncClient cannot be used there.
+
+        Parameters
+        ----------
+        text : str
+            Text to embed.
+
+        Returns
+        -------
+        list[float]
+            1536-dimensional embedding vector.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            If the OpenAI API responds with a 4xx or 5xx status code.
+        """
+        headers = {
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "text-embedding-3-small",
+            "input": text,
+        }
+
+        with httpx.Client() as client:
+            response = client.post(
+                f"{_OPENAI_API_BASE}/embeddings",
+                headers=headers,
+                json=payload,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+
+        data = response.json()
         return data["data"][0]["embedding"]

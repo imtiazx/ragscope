@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # Private helpers
 # ---------------------------------------------------------------------------
 
-async def _generate_answer(
+def _generate_answer(
     question: str,
     contexts: list[str],
     provider: object,
@@ -61,6 +61,11 @@ async def _generate_answer(
     chunk contents, then calls the LLM to produce an answer. This answer is
     what RAGAS evaluates for faithfulness and answer relevancy.
 
+    Declared as a regular (non-async) function because it runs inside
+    _run_evaluation_async which itself runs on a plain asyncio event loop
+    with no anyio task scope. provider.complete_sync() uses httpx.Client
+    (blocking) rather than httpx.AsyncClient so no anyio context is needed.
+
     Parameters
     ----------
     question : str
@@ -68,7 +73,7 @@ async def _generate_answer(
     contexts : list[str]
         Text content of retrieved chunks, in retrieval rank order.
     provider : object
-        An object with an async complete(prompt: str) -> str method.
+        An object with a complete_sync(prompt: str) -> str method.
 
     Returns
     -------
@@ -84,10 +89,10 @@ async def _generate_answer(
         f"Question: {question}\n\n"
         "Answer:"
     )
-    return await provider.complete(prompt)
+    return provider.complete_sync(prompt)
 
 
-async def _run_ragas(
+def _run_ragas(
     question: str,
     answer: str,
     contexts: list[str],
@@ -97,10 +102,10 @@ async def _run_ragas(
 
     Imports RAGAS and its datasets dependency lazily so this module is
     importable without those packages installed (tests mock this function).
-    ragas_evaluate() is called synchronously because this function is only
-    ever reached from _run_evaluation_async, which itself runs inside
-    loop.run_until_complete() in a dedicated background thread with no other
-    coroutines competing on its event loop.
+    Declared as a regular (non-async) function because it runs inside
+    _run_evaluation_async on a plain asyncio event loop. RAGAS makes its
+    own OpenAI calls via the openai SDK (not httpx.AsyncClient), so it does
+    not encounter the anyio task scope requirement that breaks AsyncClient.
 
     The OpenAI API key is written to os.environ here because RAGAS reads it
     via its langchain dependency. This is the only place in the codebase that
@@ -399,12 +404,14 @@ async def _run_evaluation_async(
             results = await compressor.compress(results, question)
 
         # Step 5: generate the answer that RAGAS will evaluate.
+        # _generate_answer and _run_ragas are sync (not async) because they
+        # run on a plain asyncio event loop with no anyio task scope.
         provider = OpenAIProvider()
         contexts = [r.content for r in results]
-        generated_answer = await _generate_answer(question, contexts, provider)
+        generated_answer = _generate_answer(question, contexts, provider)
 
-        # Step 6: run RAGAS metric computation via the thread-pool wrapper.
-        scores = await _run_ragas(question, generated_answer, contexts)
+        # Step 6: run RAGAS metric computation synchronously.
+        scores = _run_ragas(question, generated_answer, contexts)
         print(f"[DEBUG] RAGAS complete scores={scores} run_id={run_id}", flush=True)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0

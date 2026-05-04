@@ -204,15 +204,18 @@ class HyDeRetriever(BaseRetriever):
         """
         t0 = time.perf_counter()
 
+        # complete_sync() and embed_sync() use httpx.Client (blocking). This
+        # function runs inside _run_evaluation_async on a plain asyncio event
+        # loop with no anyio task scope; AsyncClient.__aenter__ requires anyio.
         provider = self._provider if self._provider is not None else OpenAIProvider()
 
         # Step 1: generate the hypothetical answer using the configured length.
         length_instruction = _LENGTH_INSTRUCTIONS[self.hypothetical_doc_length]
         prompt = _build_prompt(query, length_instruction)
-        hypothesis = await provider.complete(prompt)
+        hypothesis = provider.complete_sync(prompt)
 
         # Step 2: embed the hypothesis, not the raw query.
-        hypothesis_embedding = await provider.embed(hypothesis)
+        hypothesis_embedding = provider.embed_sync(hypothesis)
 
         # Step 3: rank corpus by similarity to the hypothesis embedding.
         scored: list[tuple[float, dict]] = [

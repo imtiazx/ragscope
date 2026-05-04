@@ -12,7 +12,6 @@ The BM25 index is built at construction time from corpus text so retrieve()
 does not repeat that work per query.
 """
 
-import asyncio
 import math
 import time
 from typing import Optional
@@ -48,13 +47,11 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-async def _bm25_scores(bm25: BM25Okapi, query_tokens: list[str]) -> list[float]:
+def _bm25_scores(bm25: BM25Okapi, query_tokens: list[str]) -> list[float]:
     """
     Return BM25 scores for every corpus document against the tokenised query.
 
-    Defined as async so it can participate in asyncio.gather alongside the
-    genuinely async dense retrieval coroutine. The BM25 computation itself is
-    synchronous and in-memory (microseconds), so no thread pool is needed.
+    Synchronous because BM25 scoring is a pure in-memory operation with no I/O.
 
     Parameters
     ----------
@@ -71,11 +68,16 @@ async def _bm25_scores(bm25: BM25Okapi, query_tokens: list[str]) -> list[float]:
     return list(bm25.get_scores(query_tokens))
 
 
-async def _dense_scores(
+def _dense_scores(
     query: str, corpus: list[dict], provider: object
 ) -> list[float]:
     """
     Embed the query and return cosine similarity scores against every chunk.
+
+    Synchronous because it uses provider.embed_sync() (httpx.Client) rather
+    than provider.embed() (httpx.AsyncClient). This function runs inside
+    _run_evaluation_async on a plain asyncio event loop with no anyio task
+    scope; AsyncClient.__aenter__ requires anyio.
 
     Parameters
     ----------
@@ -84,14 +86,14 @@ async def _dense_scores(
     corpus : list[dict]
         Corpus chunks, each containing an "embedding" key.
     provider : object
-        LLM provider with an async embed(text) -> list[float] method.
+        LLM provider with an embed_sync(text) -> list[float] method.
 
     Returns
     -------
     list[float]
         One cosine similarity score per corpus chunk, in corpus order.
     """
-    query_embedding = await provider.embed(query)
+    query_embedding = provider.embed_sync(query)
     return [_cosine_similarity(query_embedding, chunk["embedding"]) for chunk in corpus]
 
 
@@ -275,20 +277,20 @@ class HybridRetriever(BaseRetriever):
         """
         t0 = time.perf_counter()
 
+        # embed_sync() uses httpx.Client (blocking). This function runs inside
+        # _run_evaluation_async on a plain asyncio event loop with no anyio
+        # task scope; AsyncClient.__aenter__ requires anyio.
         provider = self._provider if self._provider is not None else OpenAIProvider()
 
         # Tokenise the query the same way the corpus was tokenised so BM25
         # term frequencies are computed on a consistent vocabulary.
         query_tokens = query.lower().split()
 
-        # Launch both retrieval paths concurrently. _bm25_scores is a thin
-        # async wrapper around synchronous BM25 scoring; _dense_scores awaits
-        # the real embedding API call. gather returns both results together
-        # once both coroutines complete.
-        bm25_raw, dense_raw = await asyncio.gather(
-            _bm25_scores(self._bm25, query_tokens),
-            _dense_scores(query, self.corpus, provider),
-        )
+        # Both paths are now synchronous, so call them sequentially rather
+        # than via asyncio.gather. BM25 scoring is in-memory (microseconds);
+        # dense scoring makes one blocking embedding API call.
+        bm25_raw = _bm25_scores(self._bm25, query_tokens)
+        dense_raw = _dense_scores(query, self.corpus, provider)
 
         # Fuse the two score lists using weighted Reciprocal Rank Fusion.
         fused = _rrf_fuse(bm25_raw, dense_raw, self.bm25_weight, self.rrf_k)

@@ -58,9 +58,14 @@ class _SequentialProvider:
     """
     Mock LLM provider that returns responses from a pre-set list in order.
 
-    The i-th call to complete() returns responses[i]. If more calls are made
-    than responses provided, the last response is repeated. This lets tests
-    configure per-chunk compression outcomes precisely.
+    The i-th call to complete() / complete_sync() returns responses[i]. If
+    more calls are made than responses provided, the last response is repeated.
+    This lets tests configure per-chunk compression outcomes precisely.
+
+    complete_sync() is the variant called by ContextualCompressor.compress()
+    in the background task execution path (httpx.Client, no anyio dependency).
+    Both variants share the same counter and response list so test assertions
+    work regardless of which variant is called.
     """
 
     def __init__(self, responses: list[str]) -> None:
@@ -70,19 +75,26 @@ class _SequentialProvider:
         Parameters
         ----------
         responses : list[str]
-            Strings to return on successive complete() calls.
+            Strings to return on successive complete() / complete_sync() calls.
         """
         self.responses = responses
         self.call_count = 0
         self.prompts_received: list[str] = []
 
-    async def complete(self, prompt: str) -> str:
+    def _next_response(self, prompt: str) -> str:
         """Return the next configured response and record the prompt."""
         self.prompts_received.append(prompt)
-        # Use the last response if we have more calls than configured responses.
         idx = min(self.call_count, len(self.responses) - 1)
         self.call_count += 1
         return self.responses[idx]
+
+    async def complete(self, prompt: str) -> str:
+        """Async variant: return the next configured response."""
+        return self._next_response(prompt)
+
+    def complete_sync(self, prompt: str) -> str:
+        """Sync variant: return the next configured response (used by compress())."""
+        return self._next_response(prompt)
 
 
 # ---------------------------------------------------------------------------

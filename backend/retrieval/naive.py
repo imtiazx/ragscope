@@ -125,8 +125,11 @@ class NaiveRetriever(BaseRetriever):
         """
         t0 = time.perf_counter()
 
+        # embed_sync() uses httpx.Client (blocking) instead of httpx.AsyncClient.
+        # This function runs inside _run_evaluation_async on a plain asyncio event
+        # loop with no anyio task scope; AsyncClient.__aenter__ requires anyio.
         provider = self._provider if self._provider is not None else OpenAIProvider()
-        query_embedding = await provider.embed(query)
+        query_embedding = provider.embed_sync(query)
 
         # Score every chunk against the query embedding.
         scored: list[tuple[float, dict]] = [

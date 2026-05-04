@@ -15,7 +15,7 @@ Test focus:
 
 import datetime
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -169,8 +169,8 @@ async def test_status_transitions_to_running_then_completed():
 
     with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
-         patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
-         patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
+         patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
+         patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
         mock_gp.return_value = pool
         mock_gen.return_value = "generated answer text"
@@ -208,8 +208,8 @@ async def test_completed_run_writes_all_metric_fields():
 
     with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
-         patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
-         patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
+         patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
+         patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
         mock_gp.return_value = pool
         mock_gen.return_value = "answer"
@@ -254,8 +254,8 @@ async def test_failed_run_sets_status_to_failed():
 
     with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
-         patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
-         patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
+         patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
+         patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
         mock_gp.return_value = pool
         mock_gen.return_value = "answer"
@@ -290,8 +290,8 @@ async def test_failed_run_writes_error_message():
 
     with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
-         patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
-         patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
+         patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
+         patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
         mock_gp.return_value = pool
         mock_gen.return_value = "answer"
@@ -338,8 +338,8 @@ async def test_run_evaluation_never_raises():
 
     with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
-         patch("backend.eval.ragas_runner._generate_answer", new_callable=AsyncMock) as mock_gen, \
-         patch("backend.eval.ragas_runner._run_ragas", new_callable=AsyncMock) as mock_ragas:
+         patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
+         patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
         mock_gp.return_value = pool
         mock_gen.return_value = "answer"

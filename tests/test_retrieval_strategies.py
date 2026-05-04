@@ -47,8 +47,14 @@ class _MockProvider:
     """
     Configurable stub for LLM providers used across all retrieval tests.
 
-    Records every call to complete() and embed() so tests can assert on
-    call order, call count, and the arguments that were passed.
+    Records every call to complete/embed (both async and sync variants) so
+    tests can assert on call order, call count, and the arguments passed.
+
+    The sync variants (complete_sync, embed_sync) are what the retrievers
+    call in production -- the background task execution path uses httpx.Client
+    rather than httpx.AsyncClient to avoid the anyio task scope requirement.
+    Both variants record calls in the same list so test assertions work
+    regardless of which variant is called.
     """
 
     def __init__(
@@ -62,9 +68,9 @@ class _MockProvider:
         Parameters
         ----------
         complete_response : str
-            String returned by every complete() call.
+            String returned by every complete() / complete_sync() call.
         embed_vector : list[float], optional
-            Vector returned by every embed() call. Defaults to [1, 0, 0].
+            Vector returned by every embed() / embed_sync() call. Defaults to [1, 0, 0].
         """
         self.complete_calls: list[str] = []
         self.embed_calls: list[str] = []
@@ -72,12 +78,22 @@ class _MockProvider:
         self._embed_vector = embed_vector if embed_vector is not None else [1.0, 0.0, 0.0]
 
     async def complete(self, prompt: str) -> str:
-        """Record the prompt and return the fixed response."""
+        """Record the prompt and return the fixed response (async variant)."""
+        self.complete_calls.append(prompt)
+        return self._complete_response
+
+    def complete_sync(self, prompt: str) -> str:
+        """Record the prompt and return the fixed response (sync variant)."""
         self.complete_calls.append(prompt)
         return self._complete_response
 
     async def embed(self, text: str) -> list[float]:
-        """Record the input text and return the fixed vector."""
+        """Record the input text and return the fixed vector (async variant)."""
+        self.embed_calls.append(text)
+        return self._embed_vector
+
+    def embed_sync(self, text: str) -> list[float]:
+        """Record the input text and return the fixed vector (sync variant)."""
         self.embed_calls.append(text)
         return self._embed_vector
 

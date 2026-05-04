@@ -166,13 +166,16 @@ class ContextualCompressor:
               - metadata["original_content"]: the full pre-compression text
               - metadata["compression_ratio"]: float, compressed/original chars
         """
+        # complete_sync() uses httpx.Client (blocking). This method runs inside
+        # _run_evaluation_async on a plain asyncio event loop with no anyio
+        # task scope; AsyncClient.__aenter__ requires anyio.
         provider = self._provider if self._provider is not None else OpenAIProvider()
 
         compressed: list[RetrievalResult] = []
 
         for result in results:
             prompt = _build_compression_prompt(query, result.content)
-            compressed_text = await provider.complete(prompt)
+            compressed_text = provider.complete_sync(prompt)
             compressed_text = compressed_text.strip()
 
             # Drop chunks whose compressed form is below the relevance floor.

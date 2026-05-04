@@ -7,9 +7,15 @@ Tier 2 BYOK users who supply their own Anthropic key. Only the complete()
 method is supported -- Anthropic does not provide a public embeddings API,
 so embed() raises NotImplementedError. API key is always read from the
 central settings object, never from os.environ directly.
-"""
 
-import asyncio
+Two method variants are provided for complete():
+  - async complete(): used by main FastAPI route handlers running on the
+    anyio-backed uvloop event loop.
+  - complete_sync(): used by the background task execution path which runs
+    on a plain asyncio event loop with no anyio task scope. See
+    openai_provider.py for the full explanation of why AsyncClient cannot
+    be used from that context.
+"""
 
 import httpx
 
@@ -30,10 +36,11 @@ class AnthropicProvider(BaseLLMProvider):
     """
     Concrete LLM provider that calls Anthropic's Messages API.
 
-    Implements complete() using claude-haiku-3, the cheapest Anthropic model,
-    which is appropriate for the high call volume of BYOK retrieval strategies.
-    Does not implement embed() because Anthropic does not offer an embeddings
-    endpoint -- callers that need embeddings must use OpenAIProvider instead.
+    Implements complete() / complete_sync() using claude-haiku-3, the cheapest
+    Anthropic model, which is appropriate for the high call volume of BYOK
+    retrieval strategies. Does not implement embed() because Anthropic does not
+    offer an embeddings endpoint -- callers that need embeddings must use
+    OpenAIProvider instead.
     """
 
     name: str = "anthropic"
@@ -43,10 +50,9 @@ class AnthropicProvider(BaseLLMProvider):
         """
         Send a prompt to claude-haiku-3 and return the completion text.
 
-        Wraps the Anthropic Messages endpoint. The prompt is sent as a single
-        user message. Anthropic's API requires the messages array to alternate
-        between user and assistant roles; sending a single user message is the
-        simplest valid form.
+        Uses httpx.AsyncClient. Call this from FastAPI route handlers or any
+        code running inside an anyio task scope. Do NOT call this from a
+        background task thread -- use complete_sync() instead.
 
         Parameters
         ----------
@@ -74,31 +80,71 @@ class AnthropicProvider(BaseLLMProvider):
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        # timeout=None disables httpx's anyio-based CancelScope which raises
-        # "Timeout should be used inside a task" when called from a plain
-        # asyncio event loop (our background task). asyncio.wait_for provides
-        # equivalent timeout protection using asyncio's native cancellation.
-        async with httpx.AsyncClient(timeout=None) as client:
-            response = await asyncio.wait_for(
-                client.post(
-                    f"{_ANTHROPIC_API_BASE}/messages",
-                    headers=headers,
-                    json=payload,
-                ),
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{_ANTHROPIC_API_BASE}/messages",
+                headers=headers,
+                json=payload,
                 timeout=30.0,
             )
             response.raise_for_status()
 
         data = response.json()
-        # Anthropic's response shape: {"content": [{"type": "text", "text": "..."}]}
-        # The content array can contain multiple blocks (e.g. tool_use + text),
-        # so we find the first block whose type is "text".
         for block in data["content"]:
             if block["type"] == "text":
                 return block["text"].strip()
 
-        # Should never happen for a plain text completion, but fail loudly if
-        # the response shape changes unexpectedly.
+        raise ValueError(f"No text block found in Anthropic response: {data}")
+
+    def complete_sync(self, prompt: str) -> str:
+        """
+        Blocking version of complete() for use in background task threads.
+
+        Uses httpx.Client (synchronous) instead of httpx.AsyncClient. Must be
+        used inside _run_evaluation_async and any retriever or compressor code
+        running in that context. See openai_provider.complete_sync() for the
+        full explanation.
+
+        Parameters
+        ----------
+        prompt : str
+            Full prompt text to send as the user message.
+
+        Returns
+        -------
+        str
+            The model's reply text, stripped of leading/trailing whitespace.
+
+        Raises
+        ------
+        httpx.HTTPStatusError
+            If the Anthropic API responds with a 4xx or 5xx status code.
+        """
+        headers = {
+            "x-api-key": settings.anthropic_api_key,
+            "anthropic-version": _ANTHROPIC_API_VERSION,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "claude-haiku-3-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        with httpx.Client() as client:
+            response = client.post(
+                f"{_ANTHROPIC_API_BASE}/messages",
+                headers=headers,
+                json=payload,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+
+        data = response.json()
+        for block in data["content"]:
+            if block["type"] == "text":
+                return block["text"].strip()
+
         raise ValueError(f"No text block found in Anthropic response: {data}")
 
     async def embed(self, text: str) -> list[float]:
@@ -113,6 +159,20 @@ class AnthropicProvider(BaseLLMProvider):
         ----------
         text : str
             Ignored.
+
+        Raises
+        ------
+        NotImplementedError
+            Always. Anthropic has no public embeddings endpoint.
+        """
+        raise NotImplementedError(
+            "Anthropic does not provide an embeddings API. "
+            "Use OpenAIProvider for embedding generation."
+        )
+
+    def embed_sync(self, text: str) -> list[float]:
+        """
+        Not supported -- Anthropic does not provide an embeddings API.
 
         Raises
         ------
