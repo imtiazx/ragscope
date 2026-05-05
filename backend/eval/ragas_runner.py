@@ -10,8 +10,15 @@ Public entry point: run_evaluation() is a regular (non-async) function.
 FastAPI's BackgroundTasks dispatcher runs non-async callables in a thread pool
 via anyio. That thread has no asyncio event loop. The sync wrapper creates one
 with asyncio.DefaultEventLoopPolicy().new_event_loop(), sets it as the current
-loop for the thread, and calls loop.run_until_complete() to drive the async
-implementation to completion. The loop is always closed in a finally block.
+loop for the thread, then wraps _run_evaluation_async in a Task via
+loop.create_task() before passing it to loop.run_until_complete(). The Task
+wrapper is required because asyncpg uses asyncio.timeout() internally when
+releasing connections. In Python 3.11+, asyncio.timeout() calls
+asyncio.current_task() and raises RuntimeError("Timeout should be used inside
+a task") if it returns None. loop.run_until_complete(coro) drives a bare
+coroutine without a Task, so current_task() is None. loop.create_task(coro)
+wraps it in a Task, making current_task() non-None for the entire evaluation.
+The loop is always closed in a finally block.
 
 Never use anyio.run() inside a FastAPI background task thread - it conflicts
 with FastAPI's anyio task scope. Never call nest_asyncio.apply() against a
@@ -26,23 +33,14 @@ thread's separate event loop.
 RAGAS and its datasets dependency are imported lazily inside _run_ragas() so
 that this module is importable in test environments where those packages are not
 installed. Tests mock _run_ragas() directly and never trigger the lazy imports.
-
-Keepalive: _run_evaluation_async starts a background asyncio task after the
-run transitions to 'running'. The task sends GET /health to RENDER_EXTERNAL_URL
-every 20 seconds. This prevents Render free-tier from spinning down the instance
-mid-evaluation -- RAGAS evaluation can take 60-120 seconds, well past Render's
-inactivity threshold. The keepalive is a no-op on local dev (env var absent).
 """
 
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from typing import Optional
-
-import httpx
 
 from backend.core.config import settings
 from backend.core.database import get_pool, make_task_pool
@@ -57,57 +55,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-async def _keepalive(stop_event: asyncio.Event, run_id: str) -> None:
-    """
-    Send periodic GET /health requests to prevent Render free-tier spin-down.
-
-    Render's free tier spins down a service after a period of HTTP inactivity.
-    A benchmark evaluation (retrieval + RAGAS) can take 60-120 seconds, during
-    which no external HTTP requests arrive, triggering a mid-run server kill.
-
-    This coroutine runs as a background asyncio task on the same event loop as
-    _run_evaluation_async. It can only interleave with the main evaluation at
-    await points -- specifically, it gets CPU time during the RAGAS evaluation
-    phase when nest_asyncio drives the event loop for async metric scoring.
-
-    The URL is read from RENDER_EXTERNAL_URL (set automatically by Render).
-    If the variable is absent (local dev, other platforms), this function
-    returns immediately without making any requests.
-
-    Parameters
-    ----------
-    stop_event : asyncio.Event
-        Set by the caller (_run_evaluation_async) in its finally block to signal
-        that the evaluation has finished and the keepalive should stop.
-    run_id : str
-        Included in log output only, for correlating keepalive pings with a run.
-    """
-    base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if not base_url:
-        return
-
-    url = f"{base_url}/health"
-    interval = 20
-
-    while not stop_event.is_set():
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            return
-        if stop_event.is_set():
-            return
-        try:
-            async with httpx.AsyncClient() as client:
-                await client.get(url, timeout=5.0)
-            print(f"[DEBUG] keepalive ping sent run_id={run_id}", flush=True)
-        except Exception as exc:
-            # Keepalive failures are non-fatal. Log and continue so the next
-            # ping attempt still fires.
-            print(
-                f"[DEBUG] keepalive ping failed run_id={run_id}: {exc}",
-                flush=True,
-            )
 
 def _generate_answer(
     question: str,
@@ -289,8 +236,17 @@ def run_evaluation(
     worker thread via anyio rather than awaiting it on the main uvloop event
     loop. The worker thread has no event loop, so this function creates one
     with asyncio.DefaultEventLoopPolicy().new_event_loop(), sets it as the
-    current loop for the thread, then calls loop.run_until_complete() to drive
-    _run_evaluation_async. The loop is always closed in a finally block.
+    current loop for the thread, then wraps _run_evaluation_async in a Task
+    via loop.create_task() before passing it to loop.run_until_complete().
+
+    The Task wrapper is required by Python 3.11+ asyncpg behaviour: asyncpg
+    calls asyncio.timeout() when releasing connections back to the pool.
+    asyncio.timeout() calls asyncio.current_task() and raises
+    RuntimeError("Timeout should be used inside a task") if it returns None.
+    loop.run_until_complete(bare_coro) drives the coroutine without a Task,
+    so current_task() is None. loop.create_task(coro) schedules the coroutine
+    as a proper Task before the loop starts, making current_task() non-None
+    for the entire evaluation including the DB write at step 7.
 
     The corpus is NOT accepted as an argument. It is fetched from the database
     inside _run_evaluation_async using the task's own pool. Passing the full
@@ -336,7 +292,13 @@ def run_evaluation(
     loop = policy.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(
+        # Wrap the coroutine in a Task before passing to run_until_complete.
+        # asyncpg uses asyncio.timeout() when releasing connections; that
+        # function requires asyncio.current_task() to be non-None (Python 3.11+).
+        # A bare coroutine passed directly to run_until_complete has no Task, so
+        # current_task() returns None and asyncpg raises RuntimeError. Creating
+        # a Task first via loop.create_task() ensures current_task() is set.
+        task = loop.create_task(
             _run_evaluation_async(
                 run_id=run_id,
                 retrieval_strategy=retrieval_strategy,
@@ -349,6 +311,7 @@ def run_evaluation(
                 corpus_hash=corpus_hash,
             )
         )
+        loop.run_until_complete(task)
     except BaseException as exc:
         # _run_evaluation_async writes status='failed' and returns normally.
         # This outer handler catches anything that still escapes (e.g. an
@@ -377,11 +340,11 @@ async def _run_evaluation_async(
     Async implementation of a full benchmark run.
 
     Called exclusively via run_evaluation() which drives it with
-    loop.run_until_complete(). Creates its own database pool via make_task_pool()
-    rather than reusing the module-level singleton from get_pool(). asyncpg pools
-    are bound to the event loop they were created on; the singleton belongs to the
-    FastAPI main event loop and cannot be used from the separate event loop
-    created in the background thread.
+    loop.run_until_complete(loop.create_task(...)). Creates its own database
+    pool via make_task_pool() rather than reusing the module-level singleton
+    from get_pool(). asyncpg pools are bound to the event loop they were
+    created on; the singleton belongs to the FastAPI main event loop and cannot
+    be used from the separate event loop created in the background thread.
 
     NEVER raises an exception -- all failures are caught, written to the database
     as status='failed' with an error_message, and the function returns normally.
@@ -401,8 +364,6 @@ async def _run_evaluation_async(
     because it is fetched here from the database rather than passed as an arg).
     """
     pool = None
-    stop_keepalive = asyncio.Event()
-    keepalive_task: Optional[asyncio.Task] = None
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
 
@@ -421,11 +382,6 @@ async def _run_evaluation_async(
                 run_uuid,
             )
         print(f"[DEBUG] status=running run_id={run_id}", flush=True)
-
-        # Start keepalive: fires GET /health every 20 s to prevent Render free-tier
-        # from spinning down the instance during the long RAGAS evaluation phase.
-        # _keepalive() is a no-op when RENDER_EXTERNAL_URL is not set (local dev).
-        keepalive_task = asyncio.ensure_future(_keepalive(stop_keepalive, run_id))
 
         # Step 2: load the corpus using the task's own pool. The corpus is never
         # passed as an argument to this function because serialising 100+ chunks
@@ -563,14 +519,6 @@ async def _run_evaluation_async(
                 )
 
     finally:
-        # Stop keepalive before closing the pool so the task exits cleanly.
-        stop_keepalive.set()
-        if keepalive_task is not None:
-            keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
         if pool is not None:
             await pool.close()
         print(f"[DEBUG] _run_evaluation_async: finally block done run_id={run_id}", flush=True)
