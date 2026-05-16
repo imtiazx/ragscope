@@ -221,14 +221,27 @@ async def create_tables() -> None:
         # Composite primary key (fingerprint_hash, date) means one row per
         # hashed fingerprint per calendar day. Old rows from previous days are
         # never updated -- the ON CONFLICT clause only matches today's row.
+        # run_count tracks strategy-level benchmark runs (Tier 1 limit 12/day).
+        # chat_count tracks live /chat questions (Tier 1 limit 5/day). The two
+        # counters are independent: enabling/disabling compression or running
+        # the chat endpoint does not consume run_count and vice versa.
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS rate_limit_counters (
                 fingerprint_hash TEXT NOT NULL,
                 date             DATE NOT NULL DEFAULT CURRENT_DATE,
                 run_count        INTEGER NOT NULL DEFAULT 0,
+                chat_count       INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (fingerprint_hash, date)
             )
         """)
+        # Backfill column for environments where the table was created by an
+        # earlier version of this function without chat_count. ADD COLUMN IF
+        # NOT EXISTS is a no-op when the column already exists, so this stays
+        # idempotent across repeated calls and across environments.
+        await conn.execute(
+            "ALTER TABLE rate_limit_counters "
+            "ADD COLUMN IF NOT EXISTS chat_count INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 async def corpus_exists(corpus_hash: str) -> bool:

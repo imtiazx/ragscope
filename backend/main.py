@@ -19,7 +19,7 @@ from backend.chunkers.registry import registry as chunker_registry
 from backend.core.database import close_pool, create_tables
 from backend.retrieval.contextual_compression import ContextualCompressor
 from backend.retrieval.registry import registry as retrieval_registry
-from backend.routers import benchmark, ingest, results
+from backend.routers import benchmark, chat, ingest, results
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +76,7 @@ app.add_middleware(
 app.include_router(ingest.router)
 app.include_router(benchmark.router)
 app.include_router(results.router)
+app.include_router(chat.router)
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,43 @@ DAILY_RUN_LIMIT = 12
 DAILY_CHAT_LIMIT = 5
 
 
+async def get_fingerprint_hash(
+    request: Request,
+    x_fingerprint: str = Header(default=""),
+) -> str:
+    """
+    FastAPI dependency that returns the SHA-256 fingerprint hash for this request.
+
+    Combines the client IP with the X-Fingerprint browser fingerprint header into
+    a single string before hashing. Both components are required to defeat the
+    two common evasion patterns: rotating IP while keeping the same browser,
+    and rotating browser/fingerprint while keeping the same IP. Either alone
+    would let a determined user reset their daily counter trivially.
+
+    The fingerprint hash is the rate-limit identity used by /benchmark and /chat.
+    It contains no plaintext PII; SHA-256 is one-way so the underlying IP cannot
+    be recovered from the hash. The colon separator between IP and fingerprint
+    prevents collisions of the form ip='1.2.3' fp='4.5' vs ip='1.2.3.4' fp='5'.
+
+    Parameters
+    ----------
+    request : Request
+        FastAPI request object. Used to extract client IP from request.client.
+    x_fingerprint : str
+        Value of the X-Fingerprint header sent by the frontend. May be empty if
+        the browser failed to compute a fingerprint; the hash is still stable
+        within a session because the IP component is unchanged.
+
+    Returns
+    -------
+    str
+        Hex-encoded SHA-256 of the form sha256("<ip>:<fingerprint>").
+    """
+    client_ip: str = request.client.host if request.client else "unknown"
+    raw_identity = f"{client_ip}:{x_fingerprint}"
+    return hashlib.sha256(raw_identity.encode()).hexdigest()
+
+
 async def check_rate_limit(
     request: Request,
     dev_access: bool = Depends(get_dev_access),
