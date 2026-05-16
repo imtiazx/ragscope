@@ -729,3 +729,65 @@ method are mechanical mirrors of the production change.
 Do not start Session H until Render serves the new commit and a
 single probe `/benchmark` confirms the parallel-load Timeout
 traceback is gone.
+
+## 2026-05-17 - Disable asyncpg connect timeout to dodge asyncio.timeout
+
+The previous fix (direct `asyncpg.connect()` instead of `create_pool()`)
+removed the gather-of-coroutines failure mode, and a 4-strategy parallel
+probe at `19:24Z` against commit `06a54d5` ran clean (4 / 4 `completed`,
+~75 s each, no Task-context errors in logs). Encouraging, but a follow-up
+Session H attempt against a different Render worker instance still
+surfaced `RuntimeError("Timeout should be used inside a task")` from
+inside `asyncpg.connect()` itself - the `asyncio.timeout()` call in the
+TCP connect path of asyncpg's compat module fires regardless of how
+asyncpg's internal coroutine structure is shaped, because the failure
+mode is deeper than the pool initialiser.
+
+### Fix: pass `timeout=None` to asyncpg
+
+`asyncpg.connect()` and `asyncpg.create_pool()` both honour
+`timeout=None`. When the timeout is None, asyncpg skips the
+`asyncio.timeout()` context manager entirely and `await`s the TCP
+connect without an application-level deadline. The connect still fails
+fast if Supabase is genuinely unreachable (OS-level socket error), so
+the loss of an application-level timeout is acceptable here - the
+background task has nothing else to race against anyway.
+
+Same treatment applied to `command_timeout=None` for query-level
+deadlines, which would otherwise wrap subsequent `execute()`/`fetch()`
+calls in their own `asyncio.timeout()` and re-trigger the bug.
+
+### Code changes
+
+`backend/core/database.py`:
+
+- `make_task_connection()`: builds the kwargs dict from `_parse_db_kwargs()`,
+  injects `timeout=None` and `command_timeout=None`, then calls
+  `asyncpg.connect(**kwargs, statement_cache_size=0)`. The codec init
+  is still invoked manually for JSONB / pgvector.
+- `make_task_pool()`: adds `timeout=None`, `command_timeout=None`,
+  `min_size=1`, `max_size=3` to the `asyncpg.create_pool()` call. The
+  small pool size keeps a stuck connection from blocking many worker
+  slots; the rest is the same as `make_task_connection`.
+
+### Trade-offs
+
+The lost timeout means a misconfigured Supabase URL would hang the
+background task indefinitely instead of failing fast at ~60 s. Mitigated
+by the fact that connection errors at the kernel level (refused, DNS
+fail, route unreachable) still surface immediately. A reachable-but-slow
+Supabase is the only case that now hangs, and that pathology has not
+been observed against the production database.
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 pass. Tests mock `make_task_connection`
+  entirely so the timeout kwarg is invisible to them.
+- Commit `fix: disable asyncpg connect timeout to avoid asyncio.timeout
+  on Python 3.14` pushed; Render redeploys.
+
+### Session H not run
+
+Do not start Session H until the user confirms the redeploy is live
+and a parallel probe (4 strategies, one question, simultaneous) all
+reach `completed` without the asyncpg traceback in Render logs.

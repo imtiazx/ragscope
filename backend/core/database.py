@@ -133,14 +133,18 @@ async def make_task_pool() -> asyncpg.Pool:
     from a different loop raises an event-loop mismatch error. Creating a
     dedicated pool here avoids that entirely.
 
-    NOTE: on Python 3.14 (Render's current runtime), asyncpg.create_pool()
-    internally calls asyncio.timeout() at a point where current_task() can
-    return None under concurrent task creation, causing
-    RuntimeError("Timeout should be used inside a task"). Background tasks
-    in ragas_runner.py therefore use make_task_connection() (below) instead,
-    which opens a single direct connection and avoids the pool initialiser's
-    timeout path. make_task_pool() is kept for tests and any future caller
-    that needs a true pool.
+    NOTE: on Python 3.14 (Render's current runtime), asyncpg's connect path
+    internally calls `asyncio.timeout()` which raises
+    `RuntimeError("Timeout should be used inside a task")` when
+    `current_task()` returns None during concurrent task creation. Passing
+    `timeout=None` and `command_timeout=None` skips the `asyncio.timeout()`
+    wrapper entirely - asyncpg waits indefinitely on the TCP connect
+    rather than racing it against a timer. The underlying socket connect
+    still fails fast if Supabase is unreachable; we just lose the
+    application-level cancellation deadline, which is acceptable here
+    because the background-task event loop has nothing else to do anyway.
+    `min_size=1`/`max_size=3` keeps the pool small so a stuck connection
+    cannot tie up many worker slots.
 
     Returns
     -------
@@ -151,7 +155,11 @@ async def make_task_pool() -> asyncpg.Pool:
     return await asyncpg.create_pool(
         **_parse_db_kwargs(),
         init=_init_connection,
+        min_size=1,
+        max_size=3,
         statement_cache_size=0,
+        timeout=None,
+        command_timeout=None,
     )
 
 
@@ -165,15 +173,19 @@ async def make_task_connection() -> asyncpg.Connection:
     the evaluation pipeline, so the overhead of a pool is wasted and its
     create_pool() initialiser actively misbehaves on Python 3.14.
 
-    Concretely on Python 3.14: asyncpg.create_pool() drives connection setup
-    via asyncio.gather() of multiple sub-coroutines, and asyncpg's compat
-    timeout (which maps to asyncio.timeout() on 3.11+) fails inside those
-    sub-coroutines when current_task() returns None - which happens under
-    parallel task creation against the same event loop. asyncpg.connect()
-    drives its own single coroutine in the caller's Task context and is not
-    affected.
+    Concretely on Python 3.14: asyncpg's connection path wraps the TCP
+    connect in `asyncio.timeout()` (via its compat module). On 3.14 that
+    `asyncio.timeout()` raises `RuntimeError("Timeout should be used inside
+    a task")` if `current_task()` returns None at the point the context
+    manager is entered, which happens on certain Render worker instances
+    under any non-trivial load. Passing `timeout=None` tells asyncpg to
+    wait indefinitely on the connect and skip the `asyncio.timeout()`
+    wrapper entirely, sidestepping the 3.14 issue. The TCP connect itself
+    still fails fast on a real network problem; only the application-level
+    deadline is removed, which is acceptable for a background task that
+    has nothing else to race against.
 
-    The codec init that create_pool's `init=` argument would normally run
+    The codec init that `create_pool`'s `init=` argument would normally run
     automatically is invoked manually here, so the returned connection
     decodes JSONB and pgvector columns identically to a pooled connection.
 
@@ -184,8 +196,11 @@ async def make_task_connection() -> asyncpg.Connection:
         owns its lifecycle and must close it via `await conn.close()` when
         done (typically in a try/finally block).
     """
+    kwargs = _parse_db_kwargs()
+    kwargs["timeout"] = None
+    kwargs["command_timeout"] = None
     conn = await asyncpg.connect(
-        **_parse_db_kwargs(),
+        **kwargs,
         statement_cache_size=0,
     )
     await _init_connection(conn)
