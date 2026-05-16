@@ -415,6 +415,15 @@ async def _run_evaluation_async(
     pool = None
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
+    # Tracks whether the final UPDATE that sets status='completed' has been
+    # acked by Postgres. asyncpg's connection-release path uses asyncio.timeout()
+    # in Python 3.11+; if current_task() returns None during release (which can
+    # happen after RAGAS's internal worker coroutines run), the release raises
+    # "Timeout should be used inside a task" AFTER the UPDATE has committed.
+    # The outer except must distinguish that post-commit cleanup noise from a
+    # genuine failure - otherwise it overwrites status='completed' with
+    # status='failed' on a run that actually succeeded.
+    completed_committed = False
 
     try:
         # Pool creation is inside the try block so that a DB connection failure
@@ -526,7 +535,12 @@ async def _run_evaluation_async(
                 latency_ms,
                 run_uuid,
             )
-            print(f"[DEBUG] step7 UPDATE executed run_id={run_id}", flush=True)
+            # asyncpg auto-commits single-statement executes, so once execute()
+            # returns the UPDATE is durably persisted. Flag the success
+            # BEFORE leaving the async-with so that if the __aexit__ release
+            # path raises, the outer except still knows the run completed.
+            completed_committed = True
+            print(f"[DEBUG] step7 UPDATE executed (completed_committed=True) run_id={run_id}", flush=True)
         # Connection has been released back to the pool here. asyncpg uses
         # asyncio.timeout() during release in Python 3.11+; if current_task()
         # returns None at this point the release raises "Timeout should be
@@ -538,6 +552,24 @@ async def _run_evaluation_async(
         # Catch BaseException (not just Exception) so that SystemExit,
         # KeyboardInterrupt, and GeneratorExit are also handled and always
         # result in a 'failed' row rather than a permanently stuck run.
+        # IMPORTANT: if completed_committed is True, the status='completed'
+        # UPDATE has already been durably persisted; the exception fired in
+        # the cleanup path (e.g. asyncpg connection release calling
+        # asyncio.timeout() without a current Task). Overwriting status to
+        # 'failed' here would corrupt a successful run, so log-and-swallow.
+        if completed_committed:
+            print(
+                f"[DEBUG] post-commit cleanup noise swallowed for run_id={run_id}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            logger.warning(
+                "_run_evaluation_async: post-commit cleanup exception swallowed "
+                "for run_id=%s (run already completed): %s",
+                run_id,
+                exc,
+            )
+            return
         print(f"[DEBUG] _run_evaluation_async FAILED run_id={run_id}: {exc}", flush=True)
         logger.exception(
             "_run_evaluation_async: run_id=%s failed: %s", run_id, exc
