@@ -73,6 +73,21 @@ export interface RunStatusResponse {
 // Base fetch with error handling
 // ---------------------------------------------------------------------------
 
+/**
+ * Error thrown by apiFetch on a non-2xx response. Carries the HTTP status
+ * code as a property so callers can branch on specific cases (e.g. 429
+ * rate limit) rather than string-matching the message. Extends Error so
+ * legacy callers that only read .message keep working unchanged.
+ */
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 function getDevTokenHeader(): Record<string, string> {
   try {
     const token = sessionStorage.getItem('ragscope_dev_token')
@@ -101,7 +116,7 @@ async function apiFetch<T>(
     } catch {
       // Non-JSON error body -- keep the status code message
     }
-    throw new Error(detail)
+    throw new ApiError(res.status, detail)
   }
   return res.json() as Promise<T>
 }
@@ -168,4 +183,51 @@ export async function createBenchmark(payload: {
 /** Poll for the status and results of a benchmark run. */
 export async function getRunStatus(runId: string): Promise<RunStatusResponse> {
   return apiFetch<RunStatusResponse>(`/results/${runId}`)
+}
+
+/**
+ * Body and response shape for POST /chat.
+ *
+ * Chat is a synchronous endpoint: one request produces one answer without
+ * creating a benchmark_runs row and without RAGAS evaluation. The backend
+ * enforces a Tier 1 daily limit of 5 questions per fingerprint+date via the
+ * chat_count column in rate_limit_counters. HTTP 429 means the limit has
+ * been reached for today; HTTP 404 means the corpus has not been ingested.
+ */
+export interface ChatRequest {
+  corpus_hash: string
+  question: string
+  retrieval_strategy: string
+  retrieval_params: Record<string, unknown>
+  compression_enabled: boolean
+  compression_params: Record<string, unknown>
+}
+
+export interface ChatChunk {
+  chunk_id: string
+  content: string
+  score: number
+  metadata?: Record<string, unknown>
+}
+
+export interface ChatResponse {
+  answer: string
+  retrieved_chunks: ChatChunk[]
+  strategy_used: string
+}
+
+/**
+ * Send one chat question against an already-ingested corpus.
+ *
+ * Returns the generated answer plus the chunks the retriever surfaced.
+ * Throws ApiError with status=429 when the daily chat quota is exhausted -
+ * callers should branch on err.status to disable the input rather than
+ * matching the message text.
+ */
+export async function chatRequest(payload: ChatRequest): Promise<ChatResponse> {
+  return apiFetch<ChatResponse>('/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
 }

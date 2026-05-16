@@ -3,14 +3,21 @@
 /**
  * Step 4 -- Chat with your corpus.
  *
- * Each user message triggers POST /benchmark with the current question and
- * strategy settings, then polls GET /results/{runId} until the answer is
- * ready. This reuses the full RAG evaluation pipeline -- every response
- * carries a faithfulness-evaluated answer alongside the retrieval metadata.
+ * Each user message triggers POST /chat with the current question and
+ * strategy settings, and the backend returns a generated answer in a single
+ * synchronous response. No benchmark_runs row is created and no RAGAS
+ * evaluation runs - the chat endpoint is the lightweight conversational
+ * surface, distinct from /benchmark which is for measurement.
  *
  * The winning strategy from Step 3 is pre-selected. A collapsible config
  * panel lets the user switch strategy or tune parameters without leaving chat.
- * Guest users receive a soft limit of 3 questions per benchmark session.
+ * Guest users get a Tier 1 daily limit of 5 chat questions enforced by the
+ * backend (chat_count in rate_limit_counters). The frontend keeps an in-memory
+ * counter purely for display - it initialises to 0 on mount and decrements on
+ * each successful response. The backend is authoritative on enforcement; if
+ * it returns HTTP 429, the input is disabled and the upgrade prompt is shown
+ * regardless of what the local counter says. Tier 0 dev mode bypasses the
+ * limit entirely and displays "Dev mode - unlimited".
  */
 
 import {
@@ -31,7 +38,7 @@ import {
 import { useAppContext, type RunResult } from '@/context/AppContext'
 import { useUI } from '@/context/UIContext'
 import ParamForm from '@/components/ParamForm'
-import { fetchStrategies, createBenchmark, getRunStatus } from '@/lib/api'
+import { fetchStrategies, chatRequest, ApiError } from '@/lib/api'
 import type { RetrieverInfo, ParamSchemaEntry } from '@/lib/api'
 
 // ---------------------------------------------------------------------------
@@ -39,7 +46,6 @@ import type { RetrieverInfo, ParamSchemaEntry } from '@/lib/api'
 // ---------------------------------------------------------------------------
 
 const GUEST_QUESTION_LIMIT = 5
-const POLL_MS = 2000
 
 // ---------------------------------------------------------------------------
 // Types
@@ -77,18 +83,6 @@ function strategyLabel(name: string): string {
 
 function buildDefaults(schema: ParamSchemaEntry[]): Record<string, unknown> {
   return Object.fromEntries(schema.map(e => [e.name, e.default]))
-}
-
-function chatCountKey(sessionId: string): string {
-  return `ragscope_chat_q_${sessionId}`
-}
-
-function getChatCount(sessionId: string): number {
-  try { return parseInt(localStorage.getItem(chatCountKey(sessionId)) ?? '0', 10) } catch { return 0 }
-}
-
-function incChatCount(sessionId: string): void {
-  try { localStorage.setItem(chatCountKey(sessionId), String(getChatCount(sessionId) + 1)) } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +206,7 @@ export default function Step4Chat() {
   const { state, setStep } = useAppContext()
   const { openBYOKDrawer } = useUI()
 
-  const isGuest   = !state.byokKey
-  const sessionId = state.runId ?? 'default'
+  const isGuest = !state.byokKey
   const [isDevMode, setIsDevMode] = useState(false)
 
   // Derive winning strategy from run history
@@ -239,10 +232,16 @@ export default function Step4Chat() {
   const [inputValue, setInputValue]   = useState('')
   const [sending, setSending]         = useState(false)
 
-  // Guest question tracking
-  const [questionsUsed, setQuestionsUsed] = useState(getChatCount(sessionId))
+  // Guest question tracking. Component-local state (not localStorage): the
+  // counter is display-only and the backend is authoritative on enforcement.
+  // questionsUsed starts at 0 on mount, increments by 1 per successful /chat
+  // response, and is forced to GUEST_QUESTION_LIMIT when the backend returns
+  // HTTP 429 (so the limit-reached UI activates immediately even if the
+  // local count says otherwise).
+  const [questionsUsed, setQuestionsUsed] = useState(0)
+  const [forcedLimitReached, setForcedLimitReached] = useState(false)
   const questionsLeft = Math.max(0, GUEST_QUESTION_LIMIT - questionsUsed)
-  const limitReached  = isGuest && !isDevMode && questionsLeft === 0
+  const limitReached  = isGuest && !isDevMode && (forcedLimitReached || questionsLeft === 0)
 
   // Scroll-to-bottom ref
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -290,89 +289,87 @@ export default function Step4Chat() {
     const userMsgId = `user-${Date.now()}`
     const thinkMsgId = `think-${Date.now()}`
 
-    // Append user message + thinking placeholder
+    // Append user message + thinking placeholder before the network call so
+    // the UI shows immediate feedback while the backend works.
     setMessages(prev => [
       ...prev,
       { id: userMsgId, role: 'user', content: text, timestamp: Date.now() },
       { id: thinkMsgId, role: 'thinking', content: '', timestamp: Date.now() },
     ])
 
-    if (isGuest) {
-      incChatCount(sessionId)
-      setQuestionsUsed(getChatCount(sessionId))
-    }
-
     try {
-      // Create a benchmark run for this chat turn
-      const { run_ids } = await createBenchmark({
-        corpus_hash:      state.corpusHash,
-        question:         text,
-        chunker_strategy: state.chunkerStrategy,
-        chunker_params:   state.chunkerParams,
-        strategies: [
-          {
-            strategy:            strategy,
-            retrieval_params:    params,
-            compression_enabled: state.compressionEnabled,
-            compression_params:  state.compressionParams,
-          },
-        ],
+      // Single synchronous request to /chat. No benchmark_runs row is created
+      // and no polling is needed - the endpoint blocks until the answer is
+      // ready and returns the answer plus retrieved chunks in one payload.
+      const response = await chatRequest({
+        corpus_hash:         state.corpusHash,
+        question:            text,
+        retrieval_strategy:  strategy,
+        retrieval_params:    params,
+        compression_enabled: state.compressionEnabled,
+        compression_params:  state.compressionParams,
       })
-      const run_id = run_ids[0]
 
-      // Poll until done, then replace the thinking placeholder
-      const poll = (): Promise<void> =>
-        new Promise(resolve => {
-          const id = setInterval(async () => {
-            try {
-              const res = await getRunStatus(run_id)
-              if (res.status === 'completed' || res.status === 'failed') {
-                clearInterval(id)
-                const answer = res.status === 'completed'
-                  ? (res.generated_answer ?? 'No answer generated.')
-                  : (res.error_message ?? 'The run failed.')
-
-                setMessages(prev =>
-                  prev.map(m =>
-                    m.id === thinkMsgId
-                      ? {
-                          id: `asst-${run_id}`,
-                          role: 'assistant' as const,
-                          content: answer,
-                          strategy: res.retrieval_strategy,
-                          chunkCount: res.retrieved_chunks?.length ?? 0,
-                          timestamp: Date.now(),
-                        }
-                      : m
-                  )
-                )
-                resolve()
-              }
-            } catch {
-              // Network hiccup -- keep polling
-            }
-          }, POLL_MS)
-        })
-
-      await poll()
-    } catch (err) {
-      // Replace thinking with error message
-      const errText = err instanceof Error ? err.message : 'Failed to generate a response.'
+      // Successful response: swap the thinking placeholder for the answer
+      // and bump the local usage counter (display only - backend already
+      // recorded chat_count + 1 atomically before retrieval ran).
       setMessages(prev =>
         prev.map(m =>
           m.id === thinkMsgId
-            ? { id: `err-${Date.now()}`, role: 'assistant' as const, content: errText, timestamp: Date.now() }
+            ? {
+                id: `asst-${Date.now()}`,
+                role: 'assistant' as const,
+                content: response.answer,
+                strategy: response.strategy_used,
+                chunkCount: response.retrieved_chunks.length,
+                timestamp: Date.now(),
+              }
             : m
         )
       )
+      if (isGuest && !isDevMode) {
+        setQuestionsUsed(c => c + 1)
+      }
+    } catch (err) {
+      // HTTP 429 means the backend has rejected the question because the
+      // daily chat_count is already at DAILY_CHAT_LIMIT. Force the
+      // limit-reached UI on regardless of what the local counter says,
+      // since the backend is authoritative.
+      if (err instanceof ApiError && err.status === 429) {
+        setForcedLimitReached(true)
+        setQuestionsUsed(GUEST_QUESTION_LIMIT)
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === thinkMsgId
+              ? {
+                  id: `err-${Date.now()}`,
+                  role: 'assistant' as const,
+                  content:
+                    'Daily chat limit reached. Add an API key in Settings ' +
+                    'to continue chatting without limits.',
+                  timestamp: Date.now(),
+                }
+              : m
+          )
+        )
+      } else {
+        const errText = err instanceof Error ? err.message : 'Failed to generate a response.'
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === thinkMsgId
+              ? { id: `err-${Date.now()}`, role: 'assistant' as const, content: errText, timestamp: Date.now() }
+              : m
+          )
+        )
+      }
     } finally {
       setSending(false)
     }
   }, [
     inputValue, sending, limitReached, state.corpusHash,
-    strategy, params, state.chunkerStrategy, state.chunkerParams,
+    strategy, params,
     state.compressionEnabled, state.compressionParams,
-    isGuest, sessionId,
+    isGuest, isDevMode,
   ])
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

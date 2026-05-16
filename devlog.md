@@ -130,3 +130,76 @@ each chat turn rather than POST /chat. That migration is the natural next
 step but is out of scope for Session F (which was backend-only per the
 task instructions: "Do not touch any frontend files"). Until the frontend
 switches, the new endpoint is unused in production traffic.
+
+## 2026-05-16 - Session D: Step4Chat switched to POST /chat
+
+Closes the frontend follow-up flagged at the end of Session F. Step 4 of
+the app no longer creates benchmark_runs rows for chat turns and no longer
+consumes the 12/day run quota when a user just wants to ask questions.
+
+### Behavior changes
+
+- One user message now triggers a single synchronous POST /chat call. The
+  request/response pipeline is gone (no `createBenchmark` followed by
+  `getRunStatus` polling); the answer arrives in one HTTP round-trip.
+- The chat counter is no longer keyed in localStorage. Component-local
+  state `questionsUsed` starts at 0 on mount and increments by 1 per
+  successful response. The backend's `chat_count` column is authoritative;
+  the in-memory counter is display-only and may desync across reloads or
+  browsers (acceptable per the prior audit note).
+- HTTP 429 from POST /chat now flips `forcedLimitReached` to true, which
+  disables the input and shows the "Daily chat limit reached - add an API
+  key" upgrade prompt immediately, regardless of what the local counter
+  says. Backend wins.
+- Tier 0 dev token: unchanged. `isDevMode` still hides the counter and
+  shows "Dev mode - unlimited"; the input never disables in dev mode.
+- Each assistant message shows `strategy_used` and `retrieved_chunks.length`
+  from the /chat response in the metadata line below the bubble.
+
+### Code
+
+- `frontend/lib/api.ts`: new `ApiError` class (extends Error, carries
+  `.status`). `apiFetch` now throws `ApiError` on non-2xx so callers can
+  branch on `err.status === 429` instead of string-matching the message.
+  Backwards compatible: legacy callers reading `.message` still work
+  because ApiError extends Error.
+- `frontend/lib/api.ts`: new `chatRequest(payload)` that POSTs /chat and
+  types the response as `{answer, retrieved_chunks: ChatChunk[],
+  strategy_used}`.
+- `frontend/app/app/steps/Step4Chat.tsx`:
+  - Removed `chatCountKey`, `getChatCount`, `incChatCount` localStorage
+    helpers and the `sessionId` derivation.
+  - Removed `POLL_MS` and the polling loop in `handleSend`.
+  - Replaced `createBenchmark(...).run_ids[0]` + `getRunStatus()` polling
+    with a single `chatRequest(...)` call.
+  - Added `forcedLimitReached` state, flipped to true on `ApiError`
+    `status === 429`.
+  - Module docstring updated to describe the new flow.
+
+### Tests and build
+
+- `python -m pytest`: 106 / 106 pass (no backend touched, sanity check only).
+- `npm run build` in `frontend/`: clean exit 0, all 6 pages prerendered.
+  `/app` bundle 126 kB, unchanged from the post-Session-F baseline (the
+  reduction from removing polling code is offset by the new ApiError
+  class plus chat types, which net out).
+
+### Verification matrix
+
+| Behavior | Expected | Result |
+|----------|----------|--------|
+| Dev mode shows "Dev mode - unlimited" | yes | unchanged from prior session |
+| Guest shows "X/5 questions remaining" | yes | now reads component state, decremented on each successful /chat |
+| Input disabled on backend 429 | yes | `forcedLimitReached` set, upgrade prompt shown |
+| benchmark_runs rows created from chat | no | confirmed - chat path no longer touches /benchmark |
+| Strategy + chunk count in message metadata | yes | now from `response.strategy_used` and `response.retrieved_chunks.length` |
+
+### Pre-existing issues not fixed in this session
+
+- BYOK (`state.byokKey` set) users still go through POST /chat instead of
+  calling the LLM provider direct from the browser. They will eventually
+  hit the same 5/day backend limit even though Tier 2 is supposed to be
+  unlimited. Implementing the direct-to-provider path via
+  `frontend/lib/llm-client.ts` is a separate task.
+- `Step2Configure.tsx` still uses localStorage for the run-count display
+  counter. Same desync caveat applies. Out of scope for this session.
