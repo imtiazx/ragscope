@@ -66,13 +66,28 @@ export interface AppState {
 
   // Step 2 -- benchmark configuration
   question: string
-  retrievalStrategy: string
-  retrievalParams: Record<string, unknown>
+
+  // Multi-strategy selection. selectedStrategies is the list of strategy names
+  // the user has selected; paramsByStrategy maps strategy name to that
+  // strategy's specific retrieval_params. Compression is orthogonal: a single
+  // compressionEnabled/compressionParams pair applies to every selected
+  // strategy when the request is submitted.
+  selectedStrategies: string[]
+  paramsByStrategy: Record<string, Record<string, unknown>>
   compressionEnabled: boolean
   compressionParams: Record<string, unknown>
 
-  // Step 3 -- results
-  runId: string | null
+  // Legacy single-value mirrors of the multi-strategy state, kept populated
+  // (set to the first selected strategy and its params at submit time) so
+  // Step4Chat - which has no concept of multi-strategy - can still find a
+  // sensible default to chat with after the benchmark completes.
+  retrievalStrategy: string
+  retrievalParams: Record<string, unknown>
+
+  // Step 3 -- results. runIds is parallel to selectedStrategies: runIds[i]
+  // is the background-task ID created by the backend for selectedStrategies[i].
+  // Step3Results polls every entry of runIds in parallel.
+  runIds: string[]
   runHistory: RunResult[]
 
   // Global
@@ -92,9 +107,11 @@ type AppAction =
   | { type: 'SET_QUESTION'; payload: string }
   | { type: 'SET_RETRIEVAL_STRATEGY'; payload: string }
   | { type: 'SET_RETRIEVAL_PARAMS'; payload: Record<string, unknown> }
+  | { type: 'SET_SELECTED_STRATEGIES'; payload: string[] }
+  | { type: 'SET_PARAMS_BY_STRATEGY'; payload: Record<string, Record<string, unknown>> }
   | { type: 'SET_COMPRESSION_ENABLED'; payload: boolean }
   | { type: 'SET_COMPRESSION_PARAMS'; payload: Record<string, unknown> }
-  | { type: 'SET_RUN_ID'; payload: string }
+  | { type: 'SET_RUN_IDS'; payload: string[] }
   | { type: 'ADD_RUN_RESULT'; payload: RunResult }
   | { type: 'CLEAR_HISTORY' }
   | { type: 'SET_BYOK_KEY'; payload: string | null }
@@ -128,12 +145,16 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, retrievalStrategy: action.payload }
     case 'SET_RETRIEVAL_PARAMS':
       return { ...state, retrievalParams: action.payload }
+    case 'SET_SELECTED_STRATEGIES':
+      return { ...state, selectedStrategies: action.payload }
+    case 'SET_PARAMS_BY_STRATEGY':
+      return { ...state, paramsByStrategy: action.payload }
     case 'SET_COMPRESSION_ENABLED':
       return { ...state, compressionEnabled: action.payload }
     case 'SET_COMPRESSION_PARAMS':
       return { ...state, compressionParams: action.payload }
-    case 'SET_RUN_ID':
-      return { ...state, runId: action.payload }
+    case 'SET_RUN_IDS':
+      return { ...state, runIds: action.payload }
     case 'ADD_RUN_RESULT': {
       const updated = [action.payload, ...state.runHistory].slice(0, 20)
       try {
@@ -171,11 +192,13 @@ const initialState: AppState = {
   chunkerStrategy: 'fixed_size',
   chunkerParams: {},
   question: '',
-  retrievalStrategy: '',
-  retrievalParams: {},
+  selectedStrategies: [],
+  paramsByStrategy: {},
   compressionEnabled: false,
   compressionParams: {},
-  runId: null,
+  retrievalStrategy: '',
+  retrievalParams: {},
+  runIds: [],
   runHistory: [],
   byokKey: null,
 }

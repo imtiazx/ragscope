@@ -1,19 +1,29 @@
 'use client'
 
 /**
- * Step 2 -- Configure and launch a benchmark run.
+ * Step 2 -- Configure and launch a multi-strategy benchmark.
  *
- * Collects the question, retrieval strategy + params, and optional contextual
- * compression settings, then POSTs to /benchmark. On success the run_id is
- * stored in AppContext and the app advances to Step 3 where results are polled.
+ * Collects the question, one or more retrieval strategies, per-strategy
+ * parameters, and the orthogonal compression toggle, then POSTs them to
+ * /benchmark as a single request. The backend creates one benchmark_runs
+ * row and dispatches one background task per selected strategy and returns
+ * all run_ids together with HTTP 202. The ids are stored in AppContext as
+ * runIds (parallel to selectedStrategies) and Step 3 polls each independently,
+ * streaming results into the comparison view as each strategy finishes.
  *
- * Guest users see a live counter showing how many of their three daily runs
- * they have already used. The counter is tracked in localStorage and resets
- * at midnight local time.
+ * Selecting N strategies counts as N runs against the guest daily limit.
+ * Below the strategy grid the user sees "This will use N of your X remaining
+ * runs." so the cost of the click is visible before they make it. Dev mode
+ * (Tier 0) shows "Dev mode - unlimited" instead of the counter.
+ *
+ * Compression is rendered as an independent toggle below the strategy
+ * configuration, deliberately outside the strategy selection area. The same
+ * compression setting is applied to every selected strategy when the request
+ * is submitted.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertCircle, ChevronLeft, Zap } from 'lucide-react'
+import { AlertCircle, Check, ChevronLeft, Zap } from 'lucide-react'
 import { useAppContext } from '@/context/AppContext'
 import { useUI } from '@/context/UIContext'
 import ParamForm from '@/components/ParamForm'
@@ -51,10 +61,10 @@ function getDailyCount(): number {
   } catch { return 0 }
 }
 
-function incrementDailyCount(): void {
+function bumpDailyCount(by: number): void {
   try {
     localStorage.setItem(DAILY_DATE_KEY, getTodayStr())
-    localStorage.setItem(DAILY_COUNT_KEY, String(getDailyCount() + 1))
+    localStorage.setItem(DAILY_COUNT_KEY, String(getDailyCount() + by))
   } catch { /* non-fatal */ }
 }
 
@@ -63,17 +73,17 @@ function buildDefaults(schema: ParamSchemaEntry[]): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// Strategy card
+// Strategy card (checkbox)
 // ---------------------------------------------------------------------------
 
 function StrategyCard({
   retriever,
   selected,
-  onSelect,
+  onToggle,
 }: {
   retriever: RetrieverInfo
   selected: boolean
-  onSelect: () => void
+  onToggle: () => void
 }) {
   const meta = STRATEGY_META[retriever.name] ?? {
     badge: 'Custom',
@@ -83,10 +93,10 @@ function StrategyCard({
   return (
     <button
       type="button"
-      role="radio"
+      role="checkbox"
       aria-checked={selected}
-      onClick={onSelect}
-      className="text-left rounded-xl p-4 flex flex-col gap-3 transition-all duration-150"
+      onClick={onToggle}
+      className="relative text-left rounded-xl p-4 flex flex-col gap-3 transition-all duration-150"
       style={{
         background: selected ? 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.06)' : 'var(--color-surface)',
         border: selected
@@ -94,8 +104,22 @@ function StrategyCard({
           : '1px solid var(--color-border)',
       }}
     >
+      {/* Selection indicator (checkbox) in the top-right */}
+      <span
+        className="absolute top-3 right-3 w-4 h-4 rounded flex items-center justify-center"
+        style={{
+          background: selected
+            ? 'var(--color-accent)'
+            : 'transparent',
+          border: `1px solid ${selected ? 'var(--color-accent)' : 'var(--color-border)'}`,
+        }}
+        aria-hidden="true"
+      >
+        {selected && <Check size={11} style={{ color: 'var(--color-accent-text)' }} />}
+      </span>
+
       {/* Name + badge */}
-      <div className="flex items-start justify-between gap-2">
+      <div className="flex items-start justify-between gap-2 pr-6">
         <span
           className="text-sm font-semibold leading-tight"
           style={{ color: selected ? 'var(--color-accent)' : 'var(--color-text-primary)' }}
@@ -199,7 +223,9 @@ function CompressionSection({
         When enabled, each retrieved chunk is passed through an LLM that extracts
         only the sentences directly relevant to your question. This reduces noise in
         the context window and tends to improve faithfulness scores at the cost of
-        one additional API call per chunk.
+        one additional API call per chunk. The same setting is applied to every
+        selected strategy. Enabling or disabling compression does not cost an
+        additional daily run.
       </div>
 
       {/* Params -- shown only when enabled */}
@@ -230,14 +256,18 @@ export default function Step2Configure() {
   const [question, setQuestion] = useState(state.question || '')
   const questionRef = useRef<HTMLTextAreaElement>(null)
 
-  // Retrieval strategy
+  // Multi-strategy selection. selectedStrategies preserves order so the
+  // backend receives strategies in the same order the user clicked them,
+  // and Step 3 can render rows in that order.
   const [retrievers, setRetrievers] = useState<RetrieverInfo[]>([])
-  const [selectedStrategy, setSelectedStrategy] = useState(state.retrievalStrategy || '')
-  const [retrievalParams, setRetrievalParams] = useState<Record<string, unknown>>(
-    state.retrievalParams || {}
+  const [selectedStrategies, setSelectedStrategies] = useState<string[]>(
+    state.selectedStrategies || []
+  )
+  const [paramsByStrategy, setParamsByStrategy] = useState<Record<string, Record<string, unknown>>>(
+    state.paramsByStrategy || {}
   )
 
-  // Compression
+  // Compression (orthogonal to retrieval strategy)
   const [compressionEnabled, setCompressionEnabled] = useState(state.compressionEnabled)
   const [compressionParams, setCompressionParams] = useState<Record<string, unknown>>(
     state.compressionParams || {}
@@ -263,43 +293,90 @@ export default function Step2Configure() {
     } catch { /* sessionStorage unavailable */ }
   }, [])
 
-  // Fetch strategies on mount
+  // Fetch strategies on mount and seed any missing per-strategy param defaults
+  // for already-selected strategies (e.g. when the user navigates back to Step 2).
   useEffect(() => {
     fetchStrategies()
       .then(data => {
         setRetrievers(data.retrievers)
         setCompressionSchema(data.compression.param_schema)
-        if (compressionParams && Object.keys(compressionParams).length === 0) {
+        if (Object.keys(compressionParams).length === 0) {
           setCompressionParams(buildDefaults(data.compression.param_schema))
         }
-        // Restore previously selected strategy params
-        if (state.retrievalStrategy && Object.keys(retrievalParams).length === 0) {
-          const prev = data.retrievers.find(r => r.name === state.retrievalStrategy)
-          if (prev) setRetrievalParams(buildDefaults(prev.param_schema))
-        }
+        // For each currently selected strategy whose params dict is empty,
+        // populate with defaults from the registry.
+        setParamsByStrategy(prev => {
+          const next = { ...prev }
+          for (const name of selectedStrategies) {
+            if (!next[name] || Object.keys(next[name]).length === 0) {
+              const r = data.retrievers.find(r => r.name === name)
+              if (r) next[name] = buildDefaults(r.param_schema)
+            }
+          }
+          return next
+        })
       })
       .catch(err => setStrategiesError(String(err)))
       .finally(() => setLoadingStrategies(false))
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const handleStrategySelect = useCallback(
+  /**
+   * Toggle a strategy in or out of the selection. New selections are appended
+   * to preserve click order; removals filter them out. When adding, default
+   * params for that strategy are seeded so the param form has values to bind to.
+   */
+  const handleStrategyToggle = useCallback(
     (name: string) => {
-      setSelectedStrategy(name)
-      const r = retrievers.find(r => r.name === name)
-      if (r) setRetrievalParams(buildDefaults(r.param_schema))
       setRunError(null)
+      setSelectedStrategies(prev => {
+        if (prev.includes(name)) {
+          return prev.filter(n => n !== name)
+        }
+        return [...prev, name]
+      })
+      setParamsByStrategy(prev => {
+        if (prev[name]) return prev
+        const r = retrievers.find(r => r.name === name)
+        if (!r) return prev
+        return { ...prev, [name]: buildDefaults(r.param_schema) }
+      })
     },
     [retrievers]
   )
 
-  const selectedRetriever = retrievers.find(r => r.name === selectedStrategy)
+  const setParamFor = useCallback(
+    (strategy: string, name: string, value: unknown) => {
+      setParamsByStrategy(prev => ({
+        ...prev,
+        [strategy]: { ...(prev[strategy] ?? {}), [name]: value },
+      }))
+    },
+    []
+  )
 
+  const resetParamsFor = useCallback(
+    (strategy: string) => {
+      const r = retrievers.find(r => r.name === strategy)
+      if (!r) return
+      setParamsByStrategy(prev => ({
+        ...prev,
+        [strategy]: buildDefaults(r.param_schema),
+      }))
+    },
+    [retrievers]
+  )
+
+  // canRun: a question, at least one strategy, not currently running, and
+  // enough remaining quota for the selection (guest tier only; dev and BYOK
+  // are unlimited from the UI's point of view).
+  const n_selected = selectedStrategies.length
+  const overQuota = isGuest && !isDevMode && n_selected > runsRemaining
   const canRun =
     question.trim().length > 0 &&
-    selectedStrategy !== '' &&
+    n_selected > 0 &&
     !running &&
-    (isGuest ? runsRemaining > 0 : true)
+    !overQuota
 
   const handleRun = async () => {
     if (!state.corpusHash) return
@@ -307,35 +384,53 @@ export default function Step2Configure() {
     setRunError(null)
 
     try {
+      // Build the strategies list in the order the user selected. Each entry
+      // carries its own retrieval_params and shares the single global
+      // compression setting (per the architecture decision: compression is
+      // orthogonal to retrieval strategy).
+      const strategies = selectedStrategies.map(name => ({
+        strategy: name,
+        retrieval_params: paramsByStrategy[name] ?? {},
+        compression_enabled: compressionEnabled,
+        compression_params: compressionEnabled ? compressionParams : {},
+      }))
+
       const result = await createBenchmark({
         corpus_hash: state.corpusHash,
         question: question.trim(),
         chunker_strategy: state.chunkerStrategy,
         chunker_params: state.chunkerParams,
-        strategies: [
-          {
-            strategy: selectedStrategy,
-            retrieval_params: retrievalParams,
-            compression_enabled: compressionEnabled,
-            compression_params: compressionEnabled ? compressionParams : {},
-          },
-        ],
+        strategies,
       })
 
-      // Persist to context
-      dispatch({ type: 'SET_QUESTION',            payload: question.trim()    })
-      dispatch({ type: 'SET_RETRIEVAL_STRATEGY',  payload: selectedStrategy   })
-      dispatch({ type: 'SET_RETRIEVAL_PARAMS',    payload: retrievalParams    })
-      dispatch({ type: 'SET_COMPRESSION_ENABLED', payload: compressionEnabled })
-      dispatch({ type: 'SET_COMPRESSION_PARAMS',  payload: compressionParams  })
-      dispatch({ type: 'SET_RUN_ID',              payload: result.run_ids[0]  })
+      // Persist the multi-strategy submission to context so Step 3 can find
+      // it. retrievalStrategy / retrievalParams are also set to the first
+      // selected strategy so Step 4 (single-strategy chat) has a sensible
+      // default after the benchmark completes.
+      const firstStrategy = selectedStrategies[0]
+      dispatch({ type: 'SET_QUESTION',             payload: question.trim()         })
+      dispatch({ type: 'SET_SELECTED_STRATEGIES',  payload: selectedStrategies      })
+      dispatch({ type: 'SET_PARAMS_BY_STRATEGY',   payload: paramsByStrategy        })
+      dispatch({ type: 'SET_RETRIEVAL_STRATEGY',   payload: firstStrategy           })
+      dispatch({ type: 'SET_RETRIEVAL_PARAMS',     payload: paramsByStrategy[firstStrategy] ?? {} })
+      dispatch({ type: 'SET_COMPRESSION_ENABLED',  payload: compressionEnabled      })
+      dispatch({ type: 'SET_COMPRESSION_PARAMS',   payload: compressionParams       })
+      dispatch({ type: 'SET_RUN_IDS',              payload: result.run_ids          })
 
-      if (isGuest) {
-        incrementDailyCount()
+      // Decrement the local guest counter by the number of strategies. The
+      // backend has already incremented its own counter by the same amount;
+      // the local display value is best-effort and may desync (documented).
+      if (isGuest && !isDevMode) {
+        bumpDailyCount(n_selected)
         setDailyCount(getDailyCount())
       }
 
-      addToast('info', 'Benchmark started. Results will be ready in about 20 seconds.')
+      addToast(
+        'info',
+        n_selected === 1
+          ? 'Benchmark started. Results will appear shortly.'
+          : `${n_selected} benchmarks started. Results stream in as each strategy finishes.`,
+      )
       setStep(3)
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to start benchmark.'
@@ -350,6 +445,12 @@ export default function Step2Configure() {
       setRunning(false)
     }
   }
+
+  // Retrievers, indexed by name, restricted to those currently selected so
+  // we can render their param forms in selection order.
+  const selectedRetrievers = selectedStrategies
+    .map(name => retrievers.find(r => r.name === name))
+    .filter((r): r is RetrieverInfo => r !== undefined)
 
   return (
     <div className="max-w-3xl lg:max-w-5xl mx-auto flex flex-col gap-10 py-6">
@@ -414,18 +515,18 @@ export default function Step2Configure() {
         />
       </section>
 
-      {/* Section: Retrieval strategy */}
+      {/* Section: Retrieval strategies */}
       <section aria-labelledby="strategy-heading">
         <h2
           id="strategy-heading"
           className="text-base font-semibold mb-1"
           style={{ color: 'var(--color-text-primary)' }}
         >
-          Choose a retrieval strategy
+          Choose one or more retrieval strategies
         </h2>
         <p className="text-xs mb-5" style={{ color: 'var(--color-text-secondary)' }}>
-          Select one strategy to benchmark. Run again with a different strategy
-          to add it to the comparison chart.
+          Select one or more strategies to compare. Each strategy counts as one
+          daily run.
         </p>
 
         {loadingStrategies && (
@@ -446,53 +547,97 @@ export default function Step2Configure() {
         )}
 
         {!loadingStrategies && !strategiesError && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3" role="radiogroup" aria-label="Retrieval strategies">
-            {retrievers.map(r => (
-              <StrategyCard
-                key={r.name}
-                retriever={r}
-                selected={r.name === selectedStrategy}
-                onSelect={() => handleStrategySelect(r.name)}
-              />
-            ))}
-          </div>
+          <>
+            <div
+              className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3"
+              role="group"
+              aria-label="Retrieval strategies (multi-select)"
+            >
+              {retrievers.map(r => (
+                <StrategyCard
+                  key={r.name}
+                  retriever={r}
+                  selected={selectedStrategies.includes(r.name)}
+                  onToggle={() => handleStrategyToggle(r.name)}
+                />
+              ))}
+            </div>
+
+            {/* Quota / selection hint below the grid */}
+            <p
+              className="text-xs mt-4"
+              style={{
+                color: overQuota ? '#FF6B6B' : 'var(--color-text-secondary)',
+              }}
+              aria-live="polite"
+            >
+              {isDevMode ? (
+                'Dev mode - unlimited'
+              ) : n_selected === 0 ? (
+                'Select at least one strategy to run a benchmark.'
+              ) : isGuest ? (
+                overQuota
+                  ? `Selected ${n_selected} but only ${runsRemaining} of ${DAILY_LIMIT} daily runs remain.`
+                  : `This will use ${n_selected} of your ${runsRemaining} remaining runs.`
+              ) : (
+                `${n_selected} strategy${n_selected === 1 ? '' : ' strategies'} selected.`
+              )}
+            </p>
+          </>
         )}
       </section>
 
-      {/* Section: Retrieval params */}
-      {selectedRetriever && selectedRetriever.param_schema.length > 0 && (
+      {/* Section: per-strategy retrieval params */}
+      {selectedRetrievers.length > 0 && (
         <section aria-labelledby="retrieval-params-heading">
-          <div className="flex items-center justify-between mb-4">
-            <h2
-              id="retrieval-params-heading"
-              className="text-base font-semibold"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              {selectedRetriever.display_name} parameters
-            </h2>
-            <button
-              type="button"
-              onClick={() => setRetrievalParams(buildDefaults(selectedRetriever.param_schema))}
-              className="btn-ghost text-xs"
-              aria-label="Reset retrieval parameters to defaults"
-            >
-              Reset defaults
-            </button>
-          </div>
-          <div
-            className="rounded-xl p-5"
-            style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+          <h2
+            id="retrieval-params-heading"
+            className="text-base font-semibold mb-4"
+            style={{ color: 'var(--color-text-primary)' }}
           >
-            <ParamForm
-              schema={selectedRetriever.param_schema}
-              values={retrievalParams}
-              onChange={(name, val) => setRetrievalParams(prev => ({ ...prev, [name]: val }))}
-            />
+            Strategy parameters
+          </h2>
+
+          <div className="flex flex-col gap-4">
+            {selectedRetrievers.map(r => (
+              <div
+                key={r.name}
+                className="rounded-xl"
+                style={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)' }}
+              >
+                <div className="flex items-center justify-between px-5 py-3" style={{ borderBottom: '1px solid var(--color-border)' }}>
+                  <span className="text-sm font-semibold" style={{ color: 'var(--color-accent)' }}>
+                    {r.display_name}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => resetParamsFor(r.name)}
+                    className="btn-ghost text-xs"
+                    aria-label={`Reset ${r.display_name} parameters to defaults`}
+                  >
+                    Reset defaults
+                  </button>
+                </div>
+                <div className="px-5 py-4">
+                  {r.param_schema.length === 0 ? (
+                    <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+                      This strategy has no configurable parameters.
+                    </p>
+                  ) : (
+                    <ParamForm
+                      schema={r.param_schema}
+                      values={paramsByStrategy[r.name] ?? {}}
+                      onChange={(name, val) => setParamFor(r.name, name, val)}
+                    />
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         </section>
       )}
 
-      {/* Section: Compression */}
+      {/* Section: Compression (orthogonal toggle) */}
       <section aria-labelledby="compression-heading">
         <h2
           id="compression-heading"
@@ -526,7 +671,6 @@ export default function Step2Configure() {
 
       {/* Run button + guest counter */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
-        {/* Run counter: dev mode overrides guest counter */}
         {isDevMode ? (
           <p className="text-xs order-2 sm:order-1 font-medium" style={{ color: '#14b8a6' }}>
             Dev mode - unlimited
@@ -555,8 +699,10 @@ export default function Step2Configure() {
               ? 'Starting benchmark run'
               : !question.trim()
               ? 'Enter a question to continue'
-              : !selectedStrategy
-              ? 'Select a retrieval strategy to continue'
+              : n_selected === 0
+              ? 'Select at least one strategy to continue'
+              : overQuota
+              ? 'Selected more strategies than remaining daily runs'
               : 'Run the benchmark'
           }
         >

@@ -1,25 +1,27 @@
 'use client'
 
 /**
- * Step 3 -- Live results poller and benchmark comparison dashboard.
+ * Step 3 -- Multi-strategy live results dashboard.
  *
- * When the step mounts, it starts polling GET /results/{runId} every 2 seconds.
- * While polling, animated status copy explains what is happening at each stage.
- * When the run completes, the result is added to runHistory in AppContext and
- * four visualizations render simultaneously:
+ * Reads state.runIds (the array of run_ids returned by /benchmark, parallel
+ * to state.selectedStrategies) and polls every entry independently. As each
+ * run reaches a terminal state ("completed" or "failed"), its result is
+ * added to runHistory and the corresponding chart and table cells update
+ * immediately - the dashboard does not wait for all strategies to finish.
  *
- *   1. Radar chart -- three metric axes, one polygon per completed run
- *   2. Latency bar chart -- sorted fastest to slowest
- *   3. Comparison table -- sortable, color-coded best/worst per column
- *   4. Animated score cards -- count-up animation for the selected run
+ * Strategies still in progress appear as "evaluating..." rows in the
+ * comparison table. Failed strategies appear as error rows. Other charts
+ * (radar, latency, score cards) only render once at least one strategy has
+ * completed, since they have no data otherwise.
  *
- * All completed runs accumulate in localStorage so the chart history grows
- * across multiple runs in the same session.
+ * Run history persists across browser sessions in localStorage so the
+ * comparison view accumulates across multiple benchmark submissions.
  */
 
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -39,7 +41,7 @@ import {
   LineChart,
   Line,
 } from 'recharts'
-import { Trophy, ArrowLeft, RotateCcw, Trash2, ChevronUp, ChevronDown } from 'lucide-react'
+import { Trophy, ArrowLeft, RotateCcw, Trash2, ChevronUp, ChevronDown, Loader2 } from 'lucide-react'
 import { useAppContext, type RunResult } from '@/context/AppContext'
 import { getRunStatus } from '@/lib/api'
 
@@ -48,14 +50,6 @@ import { getRunStatus } from '@/lib/api'
 // ---------------------------------------------------------------------------
 
 const POLL_INTERVAL_MS = 2000
-
-const POLL_STAGES = [
-  { after: 0,     label: 'Retrieving chunks from your corpus...' },
-  { after: 4000,  label: 'Generating an answer from retrieved context...' },
-  { after: 9000,  label: 'Evaluating faithfulness with GPT-4o-mini...' },
-  { after: 16000, label: 'Computing context utilization and answer relevancy...' },
-  { after: 22000, label: 'Finalising and storing results...' },
-]
 
 const RUN_COLORS = ['#00D4FF', '#FF6B9D', '#FFB347', '#7CFF67', '#C67EFF', '#FF8C42']
 
@@ -192,52 +186,37 @@ function InfoTooltip({ children, text }: { children: ReactNode; text: string }) 
 }
 
 // ---------------------------------------------------------------------------
-// Polling progress
+// Live progress banner (replaces the prior full-screen polling indicator)
 // ---------------------------------------------------------------------------
 
-function PollingProgress({ startedAt }: { startedAt: number }) {
-  const [stageIdx, setStageIdx] = useState(0)
-
-  useEffect(() => {
-    const timers = POLL_STAGES.slice(1).map((stage, i) =>
-      setTimeout(() => setStageIdx(i + 1), stage.after)
-    )
-    return () => timers.forEach(clearTimeout)
-  }, [])
-
+function LiveProgressBanner({
+  pendingCount,
+  totalCount,
+}: {
+  pendingCount: number
+  totalCount: number
+}) {
+  if (pendingCount === 0) return null
   return (
-    <div className="flex flex-col items-center justify-center py-24 gap-6">
-      {/* Pulsing ring */}
-      <div
-        className="w-14 h-14 rounded-full border-2 animate-spin"
-        style={{ borderColor: `rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.15) rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.15) rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.15) var(--color-accent)` }}
+    <div
+      className="flex items-center gap-3 px-4 py-3 rounded-xl"
+      style={{
+        background: 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.05)',
+        border: '1px solid rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.18)',
+      }}
+      role="status"
+      aria-live="polite"
+    >
+      <Loader2
+        size={16}
+        className="animate-spin"
+        style={{ color: 'var(--color-accent)' }}
         aria-hidden="true"
       />
-
-      <div className="text-center max-w-xs">
-        <p
-          className="text-sm font-medium transition-all duration-500"
-          style={{ color: 'var(--color-text-primary)' }}
-          aria-live="polite"
-          key={stageIdx}
-        >
-          {POLL_STAGES[stageIdx].label}
-        </p>
-        <p className="text-xs mt-2" style={{ color: 'var(--color-text-secondary)' }}>
-          Elapsed: {Math.round((Date.now() - startedAt) / 1000)}s
-        </p>
-      </div>
-
-      {/* Stage dots */}
-      <div className="flex gap-2" aria-hidden="true">
-        {POLL_STAGES.map((_, i) => (
-          <span
-            key={i}
-            className="w-1.5 h-1.5 rounded-full transition-colors"
-            style={{ background: i <= stageIdx ? 'var(--color-accent)' : 'var(--color-border)' }}
-          />
-        ))}
-      </div>
+      <p className="text-xs" style={{ color: 'var(--color-text-primary)' }}>
+        Evaluating {pendingCount} of {totalCount} {totalCount === 1 ? 'strategy' : 'strategies'}.
+        Results appear as each one finishes.
+      </p>
     </div>
   )
 }
@@ -464,15 +443,24 @@ function LatencyBars({
 }
 
 // ---------------------------------------------------------------------------
-// Comparison table
+// Comparison table (now also renders evaluating + failed live rows)
 // ---------------------------------------------------------------------------
+
+interface FailedRow {
+  strategy: string
+  errorMessage: string
+}
 
 function ComparisonTable({
   runs,
+  evaluating,
+  failed,
   selectedId,
   onSelect,
 }: {
   runs: RunResult[]
+  evaluating: string[]
+  failed: FailedRow[]
   selectedId: string | null
   onSelect: (id: string) => void
 }) {
@@ -480,19 +468,24 @@ function ComparisonTable({
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
   const completed = runs.filter(r => r.status === 'completed')
-  if (completed.length === 0) return null
+  const hasAnything = completed.length > 0 || evaluating.length > 0 || failed.length > 0
+  if (!hasAnything) return null
+
+  // Best / worst computed over completed rows only; live rows are not ranked.
+  const safeMin = (vals: number[]) => (vals.length ? Math.min(...vals) : Infinity)
+  const safeMax = (vals: number[]) => (vals.length ? Math.max(...vals) : -Infinity)
 
   const best: Record<string, number> = {
-    faithfulness:        Math.max(...completed.map(r => r.faithfulness       ?? -Infinity)),
-    contextUtilization:  Math.max(...completed.map(r => r.contextUtilization ?? -Infinity)),
-    answerRelevancy:     Math.max(...completed.map(r => r.answerRelevancy    ?? -Infinity)),
-    latencyMs:        Math.min(...completed.map(r => r.latencyMs        ?? Infinity)), // best = fastest
+    faithfulness:        safeMax(completed.map(r => r.faithfulness       ?? -Infinity)),
+    contextUtilization:  safeMax(completed.map(r => r.contextUtilization ?? -Infinity)),
+    answerRelevancy:     safeMax(completed.map(r => r.answerRelevancy    ?? -Infinity)),
+    latencyMs:           safeMin(completed.map(r => r.latencyMs          ?? Infinity)),
   }
   const worst: Record<string, number> = {
-    faithfulness:        Math.min(...completed.map(r => r.faithfulness       ?? Infinity)),
-    contextUtilization:  Math.min(...completed.map(r => r.contextUtilization ?? Infinity)),
-    answerRelevancy:     Math.min(...completed.map(r => r.answerRelevancy    ?? Infinity)),
-    latencyMs:        Math.max(...completed.map(r => r.latencyMs        ?? -Infinity)),
+    faithfulness:        safeMin(completed.map(r => r.faithfulness       ?? Infinity)),
+    contextUtilization:  safeMin(completed.map(r => r.contextUtilization ?? Infinity)),
+    answerRelevancy:     safeMin(completed.map(r => r.answerRelevancy    ?? Infinity)),
+    latencyMs:           safeMax(completed.map(r => r.latencyMs          ?? -Infinity)),
   }
 
   const sorted = [...completed].sort((a, b) => {
@@ -587,6 +580,55 @@ function ComparisonTable({
                 ))}
                 <td className="px-4 py-3 text-center font-mono" style={{ color: cellColor('latencyMs', r.latencyMs) }}>
                   {r.latencyMs !== null ? `${Math.round(r.latencyMs).toLocaleString()} ms` : '--'}
+                </td>
+              </tr>
+            ))}
+
+            {/* Live "evaluating..." rows for strategies still being scored. */}
+            {evaluating.map(name => (
+              <tr
+                key={`eval-${name}`}
+                className="transition-colors"
+                style={{
+                  background: 'rgba(255,255,255,0.02)',
+                  borderBottom: '1px solid var(--color-border)',
+                }}
+                aria-live="polite"
+                role="row"
+              >
+                <td className="px-4 py-3 font-medium" style={{ color: 'var(--color-text-primary)' }}>
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2
+                      size={12}
+                      className="animate-spin"
+                      style={{ color: 'var(--color-accent)' }}
+                      aria-hidden="true"
+                    />
+                    {strategyLabel(name)}
+                  </span>
+                </td>
+                <td colSpan={4} className="px-4 py-3 text-center" style={{ color: 'var(--color-text-secondary)' }}>
+                  evaluating...
+                </td>
+              </tr>
+            ))}
+
+            {/* Failed rows */}
+            {failed.map(({ strategy, errorMessage }) => (
+              <tr
+                key={`fail-${strategy}`}
+                className="transition-colors"
+                style={{
+                  background: 'rgba(255,107,107,0.04)',
+                  borderBottom: '1px solid var(--color-border)',
+                }}
+                role="row"
+              >
+                <td className="px-4 py-3 font-medium" style={{ color: '#FF6B6B' }}>
+                  {strategyLabel(strategy)}
+                </td>
+                <td colSpan={4} className="px-4 py-3 text-center text-xs" style={{ color: 'rgba(255,107,107,0.85)' }}>
+                  failed: {errorMessage}
                 </td>
               </tr>
             ))}
@@ -696,96 +738,165 @@ function ScoreCards({ run, allRuns }: { run: RunResult; allRuns: RunResult[] }) 
 export default function Step3Results() {
   const { state, dispatch, addRunResult, clearHistory, setStep } = useAppContext()
 
-  const runId   = state.runId
+  // Pull parallel arrays out of context. runIds[i] corresponds to
+  // selectedStrategies[i] - the backend returns run_ids in the same order
+  // the strategies list was sent.
+  const runIds = state.runIds
+  const strategies = state.selectedStrategies
   const history = state.runHistory
 
-  const [polling, setPolling]       = useState(!history.find(r => r.runId === runId))
-  const [pollError, setPollError]   = useState<string | null>(null)
-  const [startedAt]                 = useState(Date.now)
-  const [selectedId, setSelectedId] = useState<string | null>(runId)
+  // Map runId -> strategy for the current submission. Used by evaluating
+  // and failed rendering to label each pending row with its strategy name.
+  const strategyByRunId = useMemo(() => {
+    const m: Record<string, string> = {}
+    runIds.forEach((id, i) => { m[id] = strategies[i] ?? 'unknown' })
+    return m
+  }, [runIds, strategies])
 
-  // Prevent adding the same run twice across re-renders
-  const addedRef = useRef(new Set<string>())
-
-  // Restore a previously seen run_id on mount
-  useEffect(() => {
-    if (runId && history.find(r => r.runId === runId)) {
-      addedRef.current.add(runId)
-      setPolling(false)
+  // Tracks runIds whose terminal state has already been observed and pushed
+  // to runHistory. Initialized from history in case the user revisits Step 3
+  // after a tab refresh or a back-then-forward navigation.
+  const [completedRunIds, setCompletedRunIds] = useState<Set<string>>(() => {
+    const initial = new Set<string>()
+    for (const r of history) {
+      if (runIds.includes(r.runId)) initial.add(r.runId)
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    return initial
+  })
 
-  // Polling effect
+  const [errorByRunId, setErrorByRunId] = useState<Record<string, string>>({})
+  const [pollError, setPollError] = useState<string | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+
+  // Ref-based "already-added" guard prevents double-inserting a result into
+  // runHistory across re-renders. addedRef survives re-renders while
+  // state-based dedupe would not because state updates are async.
+  const addedRef = useRef<Set<string>>(new Set())
+
+  // The pending runIds (subset of runIds not yet terminal) drives the polling
+  // effect. Joining to a string gives the effect a stable primitive dep so
+  // the interval is only torn down and rebuilt when set membership changes.
+  const pendingRunIds = useMemo(
+    () => runIds.filter(id => !completedRunIds.has(id)),
+    [runIds, completedRunIds]
+  )
+  const pendingKey = pendingRunIds.join(',')
+
+  // Polling effect: every POLL_INTERVAL_MS, query the status of every still-
+  // pending run in parallel. When one terminates, push it into runHistory
+  // and add its id to completedRunIds so the next tick stops polling it.
+  // Other pending runs continue independently.
   useEffect(() => {
-    if (!runId || !polling) return
+    if (pendingRunIds.length === 0) return
 
-    const id = setInterval(async () => {
-      try {
-        const res = await getRunStatus(runId)
-        if (res.status === 'completed' || res.status === 'failed') {
-          clearInterval(id)
-          setPolling(false)
+    const interval = setInterval(async () => {
+      await Promise.all(
+        pendingRunIds.map(async (runId) => {
+          try {
+            const res = await getRunStatus(runId)
+            if (res.status === 'completed' || res.status === 'failed') {
+              if (addedRef.current.has(runId)) return
+              addedRef.current.add(runId)
 
-          if (!addedRef.current.has(runId)) {
-            addedRef.current.add(runId)
-            addRunResult({
-              runId:              res.id,
-              retrievalStrategy:  res.retrieval_strategy,
-              question:           res.question,
-              faithfulness:       res.faithfulness,
-              contextUtilization: res.context_utilization,
-              answerRelevancy:    res.answer_relevancy,
-              latencyMs:          res.latency_ms,
-              generatedAnswer:    res.generated_answer,
-              retrievedChunks:    res.retrieved_chunks,
-              timestamp:          Date.now(),
-              status:             res.status,
-              errorMessage:       res.error_message ?? undefined,
-            })
+              addRunResult({
+                runId:              res.id,
+                retrievalStrategy:  res.retrieval_strategy,
+                question:           res.question,
+                faithfulness:       res.faithfulness,
+                contextUtilization: res.context_utilization,
+                answerRelevancy:    res.answer_relevancy,
+                latencyMs:          res.latency_ms,
+                generatedAnswer:    res.generated_answer,
+                retrievedChunks:    res.retrieved_chunks,
+                timestamp:          Date.now(),
+                status:             res.status,
+                errorMessage:       res.error_message ?? undefined,
+              })
+
+              setCompletedRunIds(prev => {
+                const next = new Set(prev)
+                next.add(runId)
+                return next
+              })
+
+              if (res.status === 'failed') {
+                setErrorByRunId(prev => ({
+                  ...prev,
+                  [runId]: res.error_message ?? 'The evaluation run failed.',
+                }))
+              } else {
+                // First successful completion picks up the focus selection
+                // so the radar/score cards have something to highlight.
+                setSelectedId(prev => prev ?? res.id)
+              }
+            }
+          } catch {
+            // Network hiccup -- keep polling. A persistent connectivity
+            // failure surfaces via the per-run timeouts on the backend.
           }
-
-          if (res.status === 'failed') {
-            setPollError(res.error_message ?? 'The evaluation run failed.')
-          }
-        }
-      } catch {
-        // Network hiccup -- keep polling; only surface persistent errors
-      }
+        })
+      )
     }, POLL_INTERVAL_MS)
 
-    return () => clearInterval(id)
-  }, [runId, polling]) // eslint-disable-line react-hooks/exhaustive-deps
+    return () => clearInterval(interval)
+  // pendingKey changes only when the set membership of pendingRunIds changes,
+  // not on every re-render -- avoids tearing down the interval unnecessarily.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingKey])
+
+  // Surface a poll-level error only when ALL strategies in the current
+  // submission have failed. Per-strategy failures are shown as table rows
+  // instead so other strategies continue to be visible.
+  useEffect(() => {
+    if (runIds.length === 0) return
+    const failedCount = runIds.filter(id => errorByRunId[id]).length
+    if (failedCount === runIds.length) {
+      setPollError(
+        'Every strategy in this run failed. See the per-strategy errors in the table below.'
+      )
+    } else {
+      setPollError(null)
+    }
+  }, [errorByRunId, runIds])
 
   const completed = history.filter(r => r.status === 'completed')
-  const selectedRun = history.find(r => r.runId === selectedId) ?? completed[0] ?? null
+  const evaluating = pendingRunIds.map(id => strategyByRunId[id] ?? 'unknown')
+  const failed = Object.entries(errorByRunId).map(([id, msg]) => ({
+    strategy: strategyByRunId[id] ?? 'unknown',
+    errorMessage: msg,
+  }))
+
+  // The score-card focus run: explicit selection wins; otherwise pick the
+  // most recently completed run in the current submission, then fall back
+  // to the most recent in the entire history.
+  const selectedRun = useMemo(() => {
+    if (selectedId) {
+      const explicit = history.find(r => r.runId === selectedId)
+      if (explicit && explicit.status === 'completed') return explicit
+    }
+    const fromSubmission = completed.find(r => runIds.includes(r.runId))
+    return fromSubmission ?? completed[0] ?? null
+  }, [selectedId, history, runIds, completed])
 
   const handleSelect = useCallback((id: string) => setSelectedId(id), [])
 
   const handleClearHistory = () => {
     clearHistory()
-    dispatch({ type: 'SET_RUN_ID', payload: '' })
+    dispatch({ type: 'SET_RUN_IDS', payload: [] })
+    dispatch({ type: 'SET_SELECTED_STRATEGIES', payload: [] })
     setSelectedId(null)
+    setCompletedRunIds(new Set())
+    setErrorByRunId({})
+    addedRef.current = new Set()
   }
 
-  // ---- Render: polling state
-  if (polling) {
-    return <PollingProgress startedAt={startedAt} />
-  }
-
-  // ---- Render: failed run
-  if (pollError) {
-    return (
-      <div className="max-w-2xl mx-auto py-16 flex flex-col items-center gap-6 text-center">
-        <p className="text-sm" style={{ color: '#FF6B6B' }}>{pollError}</p>
-        <button onClick={() => setStep(2)} className="btn-ghost">
-          <ArrowLeft size={14} aria-hidden="true" /> Back to configure
-        </button>
-      </div>
-    )
-  }
-
-  // ---- Render: no results yet (edge case)
-  if (completed.length === 0) {
+  // ---- Render: empty state (no current submission and no history)
+  if (
+    runIds.length === 0 &&
+    history.length === 0 &&
+    evaluating.length === 0 &&
+    failed.length === 0
+  ) {
     return (
       <div className="max-w-2xl mx-auto py-16 flex flex-col items-center gap-4 text-center">
         <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
@@ -822,22 +933,32 @@ export default function Step3Results() {
         </button>
       </div>
 
+      {/* Live progress banner -- visible only while strategies are pending */}
+      <LiveProgressBanner pendingCount={pendingRunIds.length} totalCount={runIds.length} />
+
+      {/* All-failed banner (per-strategy errors still appear in the table) */}
+      {pollError && (
+        <div
+          className="flex items-start gap-2 p-4 rounded-xl text-sm"
+          style={{ background: 'rgba(255,107,107,0.08)', border: '1px solid rgba(255,107,107,0.2)', color: '#FF6B6B' }}
+          role="alert"
+        >
+          <span>{pollError}</span>
+        </div>
+      )}
+
       {/* Winner badge */}
       <WinnerBadge runs={completed} />
 
       {/*
        * xl layout: radar chart LEFT, score cards RIGHT (side by side).
        * Below lg: stacked -- radar first, then score cards.
-       * The xl grid gives the radar more height (auto) while score cards
-       * fill the right column with their 2x2 grid.
        */}
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 xl:gap-10 items-start">
-        {/* Left: radar chart */}
         <div className="card">
           <MetricRadar runs={completed} selectedId={selectedId} onSelect={handleSelect} />
         </div>
 
-        {/* Right: score cards (2x2 grid) */}
         {selectedRun && (
           <div>
             <ScoreCards run={selectedRun} allRuns={history} />
@@ -846,12 +967,20 @@ export default function Step3Results() {
       </div>
 
       {/* Latency bar chart -- full width */}
-      <div className="card">
-        <LatencyBars runs={completed} selectedId={selectedId} onSelect={handleSelect} />
-      </div>
+      {completed.length > 0 && (
+        <div className="card">
+          <LatencyBars runs={completed} selectedId={selectedId} onSelect={handleSelect} />
+        </div>
+      )}
 
-      {/* Comparison table */}
-      <ComparisonTable runs={completed} selectedId={selectedId} onSelect={handleSelect} />
+      {/* Comparison table -- always rendered when there is anything to show */}
+      <ComparisonTable
+        runs={completed}
+        evaluating={evaluating}
+        failed={failed}
+        selectedId={selectedId}
+        onSelect={handleSelect}
+      />
 
       {/* Generated answer for selected run */}
       {selectedRun?.generatedAnswer && (
@@ -873,12 +1002,14 @@ export default function Step3Results() {
         </div>
       )}
 
-      {/* Proceed to Chat */}
+      {/* Proceed to Chat -- only enabled once at least one run has completed
+          so the chat picks a sensible default strategy. */}
       <div className="flex justify-end">
         <button
           type="button"
           onClick={() => setStep(4)}
           className="btn-accent"
+          disabled={completed.length === 0}
           aria-label="Proceed to chat interface"
         >
           Chat with corpus

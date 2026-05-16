@@ -203,3 +203,128 @@ consumes the 12/day run quota when a user just wants to ask questions.
   `frontend/lib/llm-client.ts` is a separate task.
 - `Step2Configure.tsx` still uses localStorage for the run-count display
   counter. Same desync caveat applies. Out of scope for this session.
+
+## 2026-05-16 - Session E: multi-strategy submission and streaming results UI
+
+Closes the largest audit gap: the backend has always accepted a list of
+strategies on POST /benchmark and created one background task per entry,
+but the frontend was hardcoded to a single-strategy radio group and a
+single-runId poll. This session aligns the frontend with the documented
+architecture decision (one run_id per strategy, streamed independently).
+
+### State (AppContext)
+
+- New fields on `AppState`:
+  - `selectedStrategies: string[]` (preserves click order)
+  - `paramsByStrategy: Record<string, Record<string, unknown>>`
+    (per-strategy retrieval params)
+  - `runIds: string[]` (parallel to selectedStrategies)
+- New actions: `SET_SELECTED_STRATEGIES`, `SET_PARAMS_BY_STRATEGY`,
+  `SET_RUN_IDS`.
+- Removed: `runId: string | null` and `SET_RUN_ID` (no consumers remain
+  after the Step 4 chat migration in Session D).
+- Legacy `retrievalStrategy` / `retrievalParams` kept on state and
+  populated from the first selected strategy at submit time, so
+  Step4Chat continues to have a sensible default to chat with after a
+  multi-strategy benchmark completes.
+
+### Step 2 (`Step2Configure.tsx`)
+
+- Replaced the `selectedStrategy: string` radio group with a
+  `selectedStrategies: string[]` multi-select. Each card is a
+  `role="checkbox"` button with a `Check` icon in the top-right that
+  flips on/off. Click-order is preserved in the array.
+- Per-strategy parameter section: when N strategies are selected, the
+  panel renders N stacked param cards, each labeled with the strategy's
+  `display_name` and a "Reset defaults" button. State for params is
+  tracked in `paramsByStrategy` keyed by strategy name.
+- Compression stays an orthogonal toggle at the bottom, outside the
+  strategy section, with copy that explicitly notes "The same setting
+  is applied to every selected strategy".
+- Run-cost hint below the strategy grid: `"This will use N of your X
+  remaining runs."` (or red `"Selected N but only X of 12 remain"`
+  when over quota). Dev mode shows `"Dev mode - unlimited"` in that
+  slot instead.
+- canRun guard: question non-empty AND N >= 1 AND (dev OR BYOK OR N <=
+  runsRemaining). Button label stays `"Run benchmark"` regardless of N.
+- POST /benchmark now sends a real list:
+  ```ts
+  strategies: selectedStrategies.map(name => ({
+    strategy: name,
+    retrieval_params: paramsByStrategy[name] ?? {},
+    compression_enabled: compressionEnabled,
+    compression_params: compressionEnabled ? compressionParams : {},
+  }))
+  ```
+  After the 202, all `result.run_ids` are dispatched as `SET_RUN_IDS`,
+  not just `[0]`.
+- Local guest counter decrements by `selectedStrategies.length` on a
+  successful response (was: always +1).
+
+### Step 3 (`Step3Results.tsx`)
+
+- Reads `state.runIds` and `state.selectedStrategies` as parallel
+  arrays. Builds `strategyByRunId` map for label rendering.
+- Polling: a single `setInterval` calls GET /results/{run_id} for
+  every still-pending run in parallel via `Promise.all`. When one
+  reaches a terminal state, its result is `addRunResult()`ed
+  immediately and `completedRunIds` is updated; the next tick stops
+  polling that one but continues for the others.
+- The effect dep is `pendingRunIds.join(',')` so the interval is only
+  torn down when set membership changes (i.e. when a run finishes),
+  not on every render.
+- Added "evaluating..." rows to the comparison table for each
+  still-pending strategy: a spin-icon + strategy label, with
+  `colspan=4` reading "evaluating..." in the metric cells. Failed
+  strategies render as red rows with the backend error message.
+- Replaced the full-screen `PollingProgress` view with a small
+  `LiveProgressBanner` at the top of the dashboard
+  ("Evaluating M of N strategies. Results appear as each one finishes.").
+  The dashboard is visible from the moment the user lands on Step 3
+  rather than blocking behind a spinner.
+- Charts (radar, latency, score cards) still gate themselves on
+  `completed.length > 0`. They were already array-based so they
+  display all completed runs in the current submission plus any from
+  prior submissions in run_history.
+- Empty state only shows when there are truly no runIds, no history,
+  no evaluating, and no failed entries.
+- "Chat with corpus" button now disabled until at least one strategy
+  has completed (otherwise Step 4 has no winner to default to).
+- "Clear history" also clears `runIds`, `selectedStrategies`,
+  `completedRunIds`, `errorByRunId`, and the `addedRef` dedupe set,
+  so the dashboard resets cleanly.
+
+### Build and test
+
+- `npm run build` -> clean exit 0, all 6 pages prerendered. `/app`
+  bundle 127 kB (+1 kB vs prior session: parallel polling, evaluating
+  rows, per-strategy param state).
+- `python -m pytest` -> 106 / 106 pass (backend untouched).
+
+### Verification matrix (per task spec)
+
+| Behavior | Expected | Result |
+|----------|----------|--------|
+| Multi-select strategy grid | yes | checkbox cards, click-order preserved |
+| At least one strategy required | yes | Run button disabled when N == 0 |
+| Quota hint "This will use N of X remaining" | yes | shown below grid; red when over quota |
+| Dev mode shows "Dev mode - unlimited" in Step 2 | yes | unchanged; replaces the quota hint and the counter pill |
+| Compression stays orthogonal | yes | separate section below the strategy params, not inside any card |
+| Run button label "Run benchmark" | yes | does not change with N |
+| POST /benchmark sends list, stores all run_ids | yes | `result.run_ids` -> `SET_RUN_IDS` |
+| Step 3 polls all run_ids in parallel | yes | single setInterval, `Promise.all` over pending |
+| Stream completion per strategy | yes | each terminal result `addRunResult`ed immediately |
+| Per-strategy "evaluating..." row | yes | spinner + label in comparison table |
+| Failed strategy row, others keep going | yes | red row, polling continues for siblings |
+| Winner badge after all complete | yes | already array-based; appears once any complete |
+| Radar / latency / table read arrays | yes | confirmed during rewrite; no per-run assumption |
+| run_history accumulates across runs | yes | `addRunResult` reducer unchanged, localStorage hydrates on mount |
+
+### Out of scope
+
+- BYOK direct-to-provider chat path (still flagged from Session D).
+- Per-strategy compression toggles (architecture explicitly says
+  compression is shared across selected strategies; not a future task).
+- Backend still inlines fingerprint computation in `benchmark.py` while
+  `/chat` uses `get_fingerprint_hash`. Could refactor benchmark.py to
+  use the same dependency; not done here.
