@@ -589,3 +589,56 @@ Session H remains blocked pending the next round of Render-log data.
 The 40-run sweep is not attempted until either the assert tells us
 the outer Task wrapping is broken (fix that first) or it confirms the
 wrapping is fine and we move on to the asyncpg-internals fix.
+
+## 2026-05-17 - Pin Render to Python 3.11
+
+The diagnostic assert from commit `3519715` confirmed the failure mode:
+
+- A single isolated /benchmark on a freshly-warm Render worker
+  succeeded (the diagnostic run earlier this session reached
+  `status=running` and produced the new
+  `[DEBUG] _run_evaluation_async ENTRY ... current_task=<Task ...>`
+  log line - the outer Task wrapping IS propagating for the first run).
+- But under parallel submission (the Session H batches of 4 strategies
+  at once) the assert fired: `current_task=None` inside
+  `_run_evaluation_async`, with `nest_asyncio.py:98` visible in the
+  traceback.
+
+So the issue is not the outer wrapper or asyncpg internals in
+isolation. It is the interaction between Python 3.14's stricter
+`asyncio.timeout()` contract, `nest_asyncio`'s patch of
+`loop.run_until_complete`, and multiple `loop.create_task()` calls
+landing on the same loop concurrently from a FastAPI background-task
+worker thread. On 3.14 the patched `run_until_complete` does not
+preserve the Task identity across the patched call boundary when
+several tasks are created on the same loop in close succession.
+
+Trying to outsmart Python 3.14 asyncio internals further is not the
+right move. The cleanest fix is to stop running on 3.14.
+
+### What changed
+
+1. `runtime.txt` at repo root contains `python-3.11.9`. Render reads
+   this file during the build phase and pins the service to that
+   exact Python version. The next deploy log should show
+   `Python 3.11.9` instead of 3.14.
+2. The diagnostic assert and entry print in `_run_evaluation_async`
+   are removed. They served their purpose (confirmed the diagnosis)
+   and on 3.11 the original `loop.create_task() +
+   loop.run_until_complete(task)` pattern works correctly. Keeping
+   the assert would just crash valid runs if any future regression
+   regressed the wrapper. All other `[DEBUG] ...` prints are kept.
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 (local was already 3.11; assert
+  removal is a no-op for tests).
+- Commit + push triggers Render redeploy. Render's build log should
+  show `python-3.11.9` selected; if it still shows 3.14 the file was
+  not honoured and we need to investigate the Render service config.
+
+### Session H still deferred
+
+Do not run Session H until the user confirms the redeploy is on
+3.11 and Render logs no longer show the asyncpg `Timeout` traceback
+under parallel load.
