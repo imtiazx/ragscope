@@ -1,6 +1,7 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 asyncpg==0.30.0
+psycopg2-binary==2.9.12
 pgvector==0.4.0
 rank-bm25==0.2.2
 openai==1.78.1

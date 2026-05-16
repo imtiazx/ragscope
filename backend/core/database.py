@@ -207,6 +207,69 @@ async def make_task_connection() -> asyncpg.Connection:
     return conn
 
 
+def make_sync_connection():
+    """
+    Return a synchronous psycopg2 connection for use in background tasks.
+
+    asyncpg's connection path on Python 3.14 (Render's runtime) calls
+    asyncio.timeout() internally regardless of any timeout argument we
+    pass; it fires inside its compat module before the timeout value is
+    consulted, raising RuntimeError("Timeout should be used inside a
+    task") when current_task() returns None. Earlier sessions tried
+    routing around this with loop.create_task() outer wrappers, direct
+    asyncpg.connect() instead of pools, and timeout=None - none of those
+    landed reliably across every Render worker instance.
+
+    psycopg2 is fully synchronous and never touches asyncio at all, so
+    it cannot trigger the failure mode by construction. The trade-off is
+    that DB calls block the event loop while they run; this is fine here
+    because the background task's loop has no other coroutines to starve
+    (the only awaits are for OpenAI / RAGAS calls between the DB hops).
+
+    The function is sync (no `async def`). Call it directly without
+    `await`. The returned connection is in manual-commit mode; callers
+    must `conn.commit()` after writes.
+
+    JSONB columns: psycopg2 returns them as already-decoded Python objects
+    (dict/list) and accepts Python objects on the way in if wrapped with
+    psycopg2.extras.Json. The retrieved_chunks_data INSERT in the eval
+    pipeline wraps its payload accordingly.
+
+    pgvector columns: pgvector.psycopg2.register_vector(conn) installs a
+    type adapter so the embedding column is returned as a numpy array.
+    The caller converts to list() to match the existing retriever
+    contract.
+
+    Returns
+    -------
+    psycopg2.extensions.connection
+        Open connection. The caller is responsible for closing it in a
+        try/finally block via `conn.close()`.
+    """
+    # Lazy imports so test environments without psycopg2 / pgvector
+    # installed do not fail to load this module.
+    import psycopg2
+    from pgvector.psycopg2 import register_vector
+
+    parsed = urlparse(settings.supabase_url)
+    host = parsed.hostname or ""
+    sslmode = "disable" if host in _LOCAL_HOSTS else "require"
+    conn = psycopg2.connect(
+        host=host,
+        port=parsed.port or 5432,
+        dbname=parsed.path.lstrip("/"),
+        user=parsed.username,
+        password=parsed.password,
+        sslmode=sslmode,
+    )
+    conn.autocommit = False
+    # Register pgvector codec so the corpus_chunks.embedding column comes
+    # back as a numpy array rather than a Postgres text representation
+    # ("[0.1,0.2,...]") that would need manual parsing.
+    register_vector(conn)
+    return conn
+
+
 async def close_pool() -> None:
     """
     Gracefully close all connections in the pool.

@@ -29,12 +29,18 @@ from backend.retrieval.base import RetrievalResult
 
 class _MockConnection:
     """
-    In-memory stand-in for an asyncpg connection.
+    In-memory stand-in for both an asyncpg connection (used by get_run via
+    pool.acquire) and a psycopg2 connection (used by _run_evaluation_async
+    via cursor()).
 
     Records every execute() call as a (query_string, args_tuple) pair so
     tests can assert on what SQL was sent and with what parameters.
-    fetchrow() returns whatever _fetchrow_result is set to.
-    fetch() returns whatever _fetch_result is set to (used for corpus loading).
+    fetchrow() / fetch() return whatever _fetchrow_result / _fetch_result
+    are set to (used by the asyncpg-style get_run path).
+    cursor() returns a _MockCursor that records into the same execute_calls
+    list, so assertions are the same regardless of which path drove them.
+    The `raise_on_execute` toggle causes both async execute() and the
+    cursor's execute() to raise, modelling a fully broken database.
     """
 
     def __init__(self) -> None:
@@ -45,9 +51,15 @@ class _MockConnection:
         # Empty list means retrievers receive an empty corpus, which the mock
         # retrievers ignore entirely -- acceptable for unit tests.
         self._fetch_result: list = []
+        self.raise_on_execute = False
+        self.commit_count = 0
+
+    # --- asyncpg-style methods (used by tests for get_run) ---
 
     async def execute(self, query: str, *args) -> None:
         """Record the call; do not actually touch a database."""
+        if self.raise_on_execute:
+            raise RuntimeError("DB completely unavailable")
         self.execute_calls.append((query, args))
 
     async def fetchrow(self, query: str, *args):
@@ -58,8 +70,66 @@ class _MockConnection:
         """Return the pre-configured list of rows (used for corpus load)."""
         return self._fetch_result
 
-    async def close(self) -> None:
-        """Match the asyncpg.Connection.close() coroutine; in-memory no-op."""
+    # --- psycopg2-style methods (used by _run_evaluation_async tests) ---
+
+    def cursor(self, cursor_factory=None) -> "_MockCursor":
+        """Return a context-manager cursor that funnels into this conn."""
+        return _MockCursor(self)
+
+    def commit(self) -> None:
+        """Bump a counter so tests can assert how many times commit ran."""
+        self.commit_count += 1
+
+    def rollback(self) -> None:
+        """No-op: tests never rollback explicitly."""
+
+    # --- close() is overloaded: sync for psycopg2, async for asyncpg ---
+    # psycopg2.connection.close() is sync; asyncpg.Connection.close() is
+    # async. _run_evaluation_async now uses the sync form, so close() is a
+    # regular method. The async get_pool path closes via pool.close()
+    # which lives on _MockPool, not here.
+
+    def close(self) -> None:
+        """psycopg2-style sync close; in-memory no-op."""
+
+
+class _MockCursor:
+    """
+    Context-manager stand-in for a psycopg2 cursor.
+
+    Records execute() calls on the parent _MockConnection so a single
+    assertion set works for both the cursor-based psycopg2 code path and
+    any future async paths. fetchall()/fetchone() return the parent's
+    pre-configured results.
+    """
+
+    def __init__(self, conn: "_MockConnection") -> None:
+        """Store the parent connection so execute() can record onto it."""
+        self._conn = conn
+
+    def __enter__(self) -> "_MockCursor":
+        """Allow `with conn.cursor() as cur:` usage."""
+        return self
+
+    def __exit__(self, *exc) -> None:
+        """Cursor goes out of scope; nothing to release for an in-memory mock."""
+
+    def execute(self, query: str, args: tuple | None = None) -> None:
+        """Record (query, args) on the parent connection."""
+        if self._conn.raise_on_execute:
+            raise RuntimeError("DB completely unavailable")
+        # Normalise psycopg2's (query, args_tuple) signature into the same
+        # (query, args_tuple) shape the asyncpg-style mocks use, so test
+        # assertions can search args without knowing which path produced them.
+        self._conn.execute_calls.append((query, tuple(args) if args else ()))
+
+    def fetchall(self) -> list:
+        """Return the parent connection's pre-configured fetch result."""
+        return self._conn._fetch_result
+
+    def fetchone(self):
+        """Return the parent connection's pre-configured single-row result."""
+        return self._conn._fetchrow_result
 
 
 class _MockAcquireCtx:
@@ -170,7 +240,7 @@ async def test_status_transitions_to_running_then_completed():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_sync_connection", new_callable=MagicMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
@@ -209,7 +279,7 @@ async def test_completed_run_writes_all_metric_fields():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_sync_connection", new_callable=MagicMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
@@ -255,7 +325,7 @@ async def test_failed_run_sets_status_to_failed():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_sync_connection", new_callable=MagicMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
@@ -291,7 +361,7 @@ async def test_failed_run_writes_error_message():
     pool, conn = _make_pool_and_conn()
     error_text = "Connection to RAGAS LLM judge timed out"
 
-    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_sync_connection", new_callable=MagicMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
@@ -328,18 +398,12 @@ async def test_run_evaluation_never_raises():
     """
     pool, conn = _make_pool_and_conn()
 
-    # Make the failure-handler's execute() also raise to stress-test the
-    # double try/except guard.
-    call_count = 0
+    # Make every execute() raise to stress-test the double try/except
+    # guard. _MockCursor.execute checks this flag on the parent connection
+    # and raises RuntimeError when set, which mirrors a fully broken DB.
+    conn.raise_on_execute = True
 
-    async def always_raise(query: str, *args) -> None:
-        nonlocal call_count
-        call_count += 1
-        raise RuntimeError("DB completely unavailable")
-
-    conn.execute = always_raise
-
-    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_sync_connection", new_callable=MagicMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
@@ -379,7 +443,7 @@ async def test_retrieval_failure_is_caught_as_failed():
         async def retrieve(self, query, top_k):
             raise ValueError("Corpus is empty")
 
-    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_sync_connection", new_callable=MagicMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry",
                {"naive": _ExplodingRetriever}):
 

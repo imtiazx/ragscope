@@ -43,7 +43,7 @@ import uuid
 from typing import Optional
 
 from backend.core.config import settings
-from backend.core.database import get_pool, make_task_connection
+from backend.core.database import get_pool, make_sync_connection
 from backend.llm.openai_provider import OpenAIProvider
 from backend.retrieval.base import RetrievalResult
 from backend.retrieval.registry import registry as retrieval_registry
@@ -412,58 +412,72 @@ async def _run_evaluation_async(
     Parameters match run_evaluation() exactly (corpus is omitted from both
     because it is fetched here from the database rather than passed as an arg).
     """
-    # Direct asyncpg connection (not a pool). On Python 3.14, asyncpg's
-    # create_pool() initialiser uses asyncio.timeout() at points where
-    # current_task() can return None under concurrent task creation,
-    # raising RuntimeError("Timeout should be used inside a task"). A
-    # single asyncpg.connect() runs entirely inside the caller's Task
-    # context and avoids that path. See backend.core.database.make_task_connection.
+    # Synchronous psycopg2 connection. We use psycopg2 in the background
+    # task path instead of asyncpg because asyncpg's connection code calls
+    # asyncio.timeout() unconditionally on Python 3.14 (Render's runtime),
+    # raising "Timeout should be used inside a task" when current_task()
+    # returns None during concurrent task creation. psycopg2 is fully sync
+    # and never touches asyncio, so the failure mode does not exist for
+    # this path. The brief blocking of the event loop on each DB call is
+    # acceptable because this thread's loop has no other coroutines to
+    # starve - the only awaits between DB hops are LLM / RAGAS calls.
+    # The FastAPI main loop still uses asyncpg via get_pool() and is
+    # unaffected.
+    import psycopg2  # noqa: PLC0415 - lazy so module imports without psycopg2 installed (tests mock).
+    import psycopg2.extras  # noqa: PLC0415
+
     conn = None
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
     # Tracks whether the final UPDATE that sets status='completed' has been
-    # acked by Postgres. asyncpg's internal teardown can still raise
-    # "Timeout should be used inside a task" AFTER the UPDATE has committed
-    # (e.g. during conn.close()). The outer except must distinguish that
-    # post-commit cleanup noise from a genuine failure - otherwise it would
-    # overwrite status='completed' with status='failed' on a successful run.
+    # acked by Postgres. The same post-commit-cleanup-noise concern from
+    # earlier asyncpg sessions still applies here: if conn.close() in the
+    # finally block raises after we have already commit()ed the success
+    # row, the outer except should NOT overwrite status to 'failed'.
     completed_committed = False
 
     try:
-        # Open the dedicated connection inside the try block so that a DB
+        # Open the synchronous connection inside the try block so that a DB
         # connect failure is caught and written as status='failed', rather
         # than propagating out and leaving the row permanently stuck in
-        # 'pending'.
-        conn = await make_task_connection()
+        # 'pending'. make_sync_connection() is sync (no `await`).
+        conn = make_sync_connection()
         print(f"[DEBUG] conn opened run_id={run_id}", flush=True)
 
         # Step 1: mark the run as in-progress so the frontend stops showing "pending".
-        await conn.execute(
-            "UPDATE benchmark_runs SET status = 'running' WHERE id = $1",
-            run_uuid,
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE benchmark_runs SET status = 'running' WHERE id = %s",
+                (run_uuid,),
+            )
+        conn.commit()
         print(f"[DEBUG] status=running run_id={run_id}", flush=True)
 
-        # Step 2: load the corpus on the dedicated connection. The corpus is
-        # never passed as an argument to this function because serialising
-        # 100+ chunks (each carrying a 1536-float embedding) across the
-        # thread boundary caused silent hangs on Render before run_evaluation
-        # even began executing. database.py's load_corpus() uses get_pool()
-        # which returns the singleton bound to the uvloop event loop -
-        # unusable here. Query inline instead.
-        rows = await conn.fetch(
-            """
-            SELECT id, content, embedding
-            FROM corpus_chunks
-            WHERE corpus_hash = $1
-            ORDER BY chunk_index
-            """,
-            corpus_hash,
-        )
+        # Step 2: load the corpus. The corpus is never passed as an argument
+        # to this function because serialising 100+ chunks (each carrying a
+        # 1536-float embedding) across the thread boundary caused silent
+        # hangs on Render before run_evaluation even began executing.
+        # database.py's load_corpus() uses get_pool() which is bound to the
+        # uvloop event loop and unusable here - query inline instead.
+        # RealDictCursor returns rows as dict-like objects so the existing
+        # `row["id"]` style of access still works.
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, content, embedding
+                FROM corpus_chunks
+                WHERE corpus_hash = %s
+                ORDER BY chunk_index
+                """,
+                (corpus_hash,),
+            )
+            rows = cur.fetchall()
         corpus = [
             {
                 "chunk_id": str(row["id"]),
                 "content": row["content"],
+                # pgvector.psycopg2.register_vector decodes the embedding
+                # column as a numpy array; list() converts to plain floats.
                 "embedding": list(row["embedding"]),
             }
             for row in rows
@@ -517,32 +531,39 @@ async def _run_evaluation_async(
         # so the frontend never sees a partial state where scores are present but
         # status is still 'running'.
         print(f"[DEBUG] step7 before UPDATE run_id={run_id}", flush=True)
-        await conn.execute(
-            """
-            UPDATE benchmark_runs SET
-                status           = 'completed',
-                retrieved_chunks = $1,
-                generated_answer = $2,
-                faithfulness     = $3,
-                context_utilization = $4,
-                answer_relevancy  = $5,
-                latency_ms        = $6
-            WHERE id = $7
-            """,
-            retrieved_chunks_data,
-            generated_answer,
-            scores["faithfulness"],
-            scores["context_utilization"],
-            scores["answer_relevancy"],
-            latency_ms,
-            run_uuid,
-        )
-        # asyncpg auto-commits single-statement executes, so once execute()
-        # returns the UPDATE is durably persisted. Set the flag immediately
-        # so any subsequent teardown noise (e.g. conn.close() raising on
-        # 3.14) does not get treated as a real failure by the outer except.
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE benchmark_runs SET
+                    status           = 'completed',
+                    retrieved_chunks = %s,
+                    generated_answer = %s,
+                    faithfulness     = %s,
+                    context_utilization = %s,
+                    answer_relevancy  = %s,
+                    latency_ms        = %s
+                WHERE id = %s
+                """,
+                (
+                    # psycopg2.extras.Json wraps the Python value with the
+                    # JSONB protocol marker; without it psycopg2 would try
+                    # to send retrieved_chunks_data as a Python repr string
+                    # and Postgres would reject the type cast.
+                    psycopg2.extras.Json(retrieved_chunks_data),
+                    generated_answer,
+                    scores["faithfulness"],
+                    scores["context_utilization"],
+                    scores["answer_relevancy"],
+                    latency_ms,
+                    run_uuid,
+                ),
+            )
+        conn.commit()
+        # Set the flag immediately after commit() returns so any subsequent
+        # teardown noise (e.g. conn.close() raising) does not get treated as
+        # a real failure by the outer except.
         completed_committed = True
-        print(f"[DEBUG] step7 UPDATE executed (completed_committed=True) run_id={run_id}", flush=True)
+        print(f"[DEBUG] step7 UPDATE committed (completed_committed=True) run_id={run_id}", flush=True)
         print(f"[DEBUG] status=completed run_id={run_id}", flush=True)
 
     except BaseException as exc:
@@ -585,16 +606,17 @@ async def _run_evaluation_async(
             )
         else:
             try:
-                await conn.execute(
-                    """
-                    UPDATE benchmark_runs SET
-                        status        = 'failed',
-                        error_message = $1
-                    WHERE id = $2
-                    """,
-                    str(exc),
-                    run_uuid,
-                )
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE benchmark_runs SET
+                            status        = 'failed',
+                            error_message = %s
+                        WHERE id = %s
+                        """,
+                        (str(exc), run_uuid),
+                    )
+                conn.commit()
             except Exception:
                 logger.exception(
                     "_run_evaluation_async: could not write failed status to DB"
@@ -606,14 +628,13 @@ async def _run_evaluation_async(
         if conn is not None:
             print(f"[DEBUG] finally: before conn.close run_id={run_id}", flush=True)
             try:
-                await conn.close()
+                # psycopg2 conn.close() is synchronous. It never touches
+                # asyncio so it cannot trip the Python 3.14 timeout bug,
+                # but we still log-and-swallow any close error so the
+                # function returns cleanly with the final row state intact.
+                conn.close()
                 print(f"[DEBUG] finally: conn.close ok run_id={run_id}", flush=True)
             except BaseException as close_exc:
-                # conn.close() can itself raise "Timeout should be used
-                # inside a task" if asyncpg's teardown calls asyncio.timeout()
-                # outside a Task context on Python 3.14. Log and swallow so
-                # the function still returns cleanly; the row is already in
-                # its final state (completed or failed) at this point.
                 print(
                     f"[DEBUG] finally: conn.close RAISED "
                     f"{type(close_exc).__name__}: {close_exc} run_id={run_id}",

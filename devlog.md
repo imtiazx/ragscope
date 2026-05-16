@@ -791,3 +791,119 @@ been observed against the production database.
 Do not start Session H until the user confirms the redeploy is live
 and a parallel probe (4 strategies, one question, simultaneous) all
 reach `completed` without the asyncpg traceback in Render logs.
+
+## 2026-05-17 - Replace asyncpg with psycopg2 in the background task
+
+The previous fix passed `timeout=None` to `asyncpg.connect()` / `create_pool()`,
+hoping asyncpg would skip its `asyncio.timeout()` wrapper. It did not.
+On Python 3.14 (Render's runtime), asyncpg's compat module calls
+`asyncio.timeout()` unconditionally inside its TCP connect path
+regardless of the timeout argument value. A 4-strategy parallel probe
+at `19:51Z` against commit `72aaaf6` reached `completed` cleanly, but
+a follow-up Session H attempt against another Render worker instance
+re-surfaced `RuntimeError("Timeout should be used inside a task")`
+from inside `asyncpg.connect()` again. Same failure mode, different
+worker.
+
+Three asyncpg-shaped fixes in a row (outer Task wrapper, direct
+connection instead of pool, `timeout=None`) have all been defeated by
+how deep `asyncio.timeout()` sits in asyncpg's connect path on 3.14.
+Time to stop fighting asyncio.timeout in code we don't own.
+
+### Fix: psycopg2 (sync) for the background task
+
+`psycopg2` is fully synchronous and never imports `asyncio.timeout()`.
+By construction it cannot trigger the bug. The FastAPI main loop keeps
+asyncpg via `get_pool()` (results polling, ingest, benchmark router DB
+ops) because the main event loop is uvloop+anyio and always has a
+current Task; the bug only manifests in the background-task path where
+we run our own event loop on a worker thread.
+
+### Code changes
+
+1. **`requirements.txt`**: added `psycopg2-binary==2.9.12` alongside
+   `asyncpg==0.30.0`. Both libraries coexist in the dependency set.
+2. **`backend/core/database.py`**: new `make_sync_connection()` that
+   opens a synchronous `psycopg2.connect()` with the same parsed
+   kwargs as the asyncpg helpers. The `options='-c statement_cache_size=0'`
+   the user suggested is omitted because `statement_cache_size` is not
+   a real Postgres GUC and would error at connect; psycopg2 already
+   does not cache prepared statements client-side, so the original
+   intent is satisfied without the option. After connect, the function
+   calls `pgvector.psycopg2.register_vector(conn)` so the
+   `corpus_chunks.embedding` column comes back as a numpy array, which
+   `list(...)` turns into the plain list of floats the retrievers
+   expect.
+3. **`backend/eval/ragas_runner.py`**:
+   - Import switched from `make_task_connection` to `make_sync_connection`.
+   - `_run_evaluation_async` still `async def` (the outer
+     `run_evaluation` wrapper still drives it via `loop.create_task` +
+     `loop.run_until_complete`), but every DB hop inside is now sync
+     psycopg2 code.
+   - `conn = make_sync_connection()` (no await).
+   - Three asyncpg `async with pool.acquire() as conn: await conn.X(...)`
+     blocks rewritten as `with conn.cursor() as cur: cur.execute(...)`
+     plus explicit `conn.commit()` (psycopg2 is in manual-commit mode).
+   - SQL placeholders translated from asyncpg's `$1`/`$2`/... to
+     psycopg2's `%s`.
+   - The JSONB payload for `retrieved_chunks_data` is wrapped in
+     `psycopg2.extras.Json(...)` so psycopg2 sends it with the right
+     type marker.
+   - Corpus-load uses `cursor_factory=psycopg2.extras.RealDictCursor`
+     so the existing `row["id"]` / `row["content"]` access style still
+     works.
+   - `await conn.close()` -> `conn.close()`.
+   - `completed_committed` cleanup guard retained as belt-and-suspenders.
+     psycopg2 close shouldn't raise, but the guard cost is one bool.
+4. **`tests/test_eval.py`**:
+   - `_MockConnection` now answers both the asyncpg-style (`async
+     execute/fetchrow/fetch`) and the psycopg2-style (`cursor()`,
+     `commit()`, sync `close()`) protocols. The asyncpg side is kept
+     because the two `get_run` tests still drive the asyncpg path via
+     the patched `get_pool` singleton.
+   - New `_MockCursor` (context-manager) records `execute()` calls
+     onto the parent connection, normalising args into the same
+     `(query, args_tuple)` shape as the async path so test assertions
+     are unchanged.
+   - The "DB completely unavailable" stress test now sets
+     `conn.raise_on_execute = True` instead of replacing
+     `conn.execute`; both the cursor's `execute()` and the async
+     `execute()` honour the flag.
+   - All six `_run_evaluation_async` test patches retargeted from
+     `make_task_connection` (AsyncMock) to `make_sync_connection`
+     (MagicMock).
+
+### Trade-offs
+
+- psycopg2 calls block the event loop while they run, but this thread's
+  loop has no other coroutines to starve. The only `await`s in
+  `_run_evaluation_async` between DB hops are LLM / RAGAS work, which
+  in turn use `httpx.Client` / sync RAGAS internals - they were already
+  blocking calls.
+- The Supabase transaction pooler (port 6543) is friendly to short,
+  auto-commit-style sessions; psycopg2 with manual commit and a small
+  set of statements per logical session falls inside that pattern.
+- We carry both database client libraries now (asyncpg + psycopg2)
+  until we are willing to migrate the FastAPI main loop too. The
+  duplication is fine; psycopg2-binary is small (~4 MB).
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 pass.
+- Commit `fix: use psycopg2 sync connection in background task to bypass
+  Python 3.14 asyncio.timeout incompatibility` pushed; Render redeploys.
+
+### Files in this commit
+
+- `backend/core/database.py` (new `make_sync_connection`)
+- `backend/eval/ragas_runner.py` (psycopg2-driven background task)
+- `tests/test_eval.py` (dual-protocol mock connection)
+- `requirements.txt` (`psycopg2-binary==2.9.12`)
+- `devlog.md` (this entry)
+
+### Session H
+
+Do not start Session H. Wait for the user to confirm the redeploy is
+live on `main` and that a parallel-load probe shows no asyncio.timeout
+traceback in Render logs (it shouldn't appear at all - psycopg2 never
+imports asyncio.timeout).
