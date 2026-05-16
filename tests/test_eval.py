@@ -58,6 +58,9 @@ class _MockConnection:
         """Return the pre-configured list of rows (used for corpus load)."""
         return self._fetch_result
 
+    async def close(self) -> None:
+        """Match the asyncpg.Connection.close() coroutine; in-memory no-op."""
+
 
 class _MockAcquireCtx:
     """Async context manager that yields a fixed connection object."""
@@ -167,12 +170,12 @@ async def test_status_transitions_to_running_then_completed():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
-        mock_gp.return_value = pool
+        mock_gp.return_value = conn
         mock_gen.return_value = "generated answer text"
         mock_ragas.return_value = _MOCK_SCORES
 
@@ -206,12 +209,12 @@ async def test_completed_run_writes_all_metric_fields():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
-        mock_gp.return_value = pool
+        mock_gp.return_value = conn
         mock_gen.return_value = "answer"
         mock_ragas.return_value = _MOCK_SCORES
 
@@ -252,12 +255,12 @@ async def test_failed_run_sets_status_to_failed():
     """
     pool, conn = _make_pool_and_conn()
 
-    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
-        mock_gp.return_value = pool
+        mock_gp.return_value = conn
         mock_gen.return_value = "answer"
         mock_ragas.side_effect = RuntimeError("RAGAS evaluation failed")
 
@@ -288,12 +291,12 @@ async def test_failed_run_writes_error_message():
     pool, conn = _make_pool_and_conn()
     error_text = "Connection to RAGAS LLM judge timed out"
 
-    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
-        mock_gp.return_value = pool
+        mock_gp.return_value = conn
         mock_gen.return_value = "answer"
         mock_ragas.side_effect = RuntimeError(error_text)
 
@@ -336,12 +339,12 @@ async def test_run_evaluation_never_raises():
 
     conn.execute = always_raise
 
-    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry", {"naive": _MockRetriever}), \
          patch("backend.eval.ragas_runner._generate_answer", new_callable=MagicMock) as mock_gen, \
          patch("backend.eval.ragas_runner._run_ragas", new_callable=MagicMock) as mock_ragas:
 
-        mock_gp.return_value = pool
+        mock_gp.return_value = conn
         mock_gen.return_value = "answer"
         mock_ragas.return_value = _MOCK_SCORES
 
@@ -376,11 +379,11 @@ async def test_retrieval_failure_is_caught_as_failed():
         async def retrieve(self, query, top_k):
             raise ValueError("Corpus is empty")
 
-    with patch("backend.eval.ragas_runner.make_task_pool", new_callable=AsyncMock) as mock_gp, \
+    with patch("backend.eval.ragas_runner.make_task_connection", new_callable=AsyncMock) as mock_gp, \
          patch("backend.eval.ragas_runner.retrieval_registry",
                {"naive": _ExplodingRetriever}):
 
-        mock_gp.return_value = pool
+        mock_gp.return_value = conn
 
         await _run_evaluation_async(
             run_id=_RUN_ID,

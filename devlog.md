@@ -642,3 +642,90 @@ right move. The cleanest fix is to stop running on 3.14.
 Do not run Session H until the user confirms the redeploy is on
 3.11 and Render logs no longer show the asyncpg `Timeout` traceback
 under parallel load.
+
+## 2026-05-17 - Use direct asyncpg connection in background task
+
+Render's free tier is locked to Python 3.14 (the `runtime.txt` pin
+from the previous entry was not honoured on this plan). Working
+around 3.14's stricter `asyncio.timeout()` contract in code instead.
+
+### Diagnosis recap
+
+`asyncpg.create_pool()` internally drives its connection setup through
+`asyncio.gather()` of multiple sub-coroutines, and asyncpg's `compat`
+timeout wraps each with `asyncio.timeout()`. On Python 3.14, when
+several background tasks call `create_pool()` concurrently against the
+same event loop in a FastAPI background-task worker thread (Session H
+batches of 4 strategies), `asyncio.current_task()` returns `None`
+inside those gathered sub-coroutines and `asyncio.timeout()` raises
+`RuntimeError("Timeout should be used inside a task")`. Single
+isolated runs avoided the race and worked fine; parallel runs broke.
+
+### Fix
+
+Sidestep `create_pool()` entirely in the background-task path by using
+a single direct `asyncpg.connect()` per benchmark run. `asyncpg.connect()`
+drives one coroutine in the caller's existing Task context and does
+not trigger the same gather/timeout pattern.
+
+### Code changes
+
+1. `backend/core/database.py`: new `make_task_connection()` returns a
+   single `asyncpg.Connection`. It applies the same `_init_connection`
+   codec registration (JSONB + pgvector) that the pool's `init=`
+   callback would have applied automatically. `make_task_pool()` is
+   kept in place for tests and any future caller that genuinely
+   needs a pool.
+2. `backend/eval/ragas_runner.py`: `_run_evaluation_async` now opens
+   a single connection at the start (`conn = await make_task_connection()`)
+   and closes it in the finally block. All four `async with
+   pool.acquire() as conn:` blocks become direct `await conn.execute(...)`
+   or `await conn.fetch(...)` calls. The post-commit cleanup-noise
+   guard (`completed_committed` flag) is retained: even on a direct
+   connection, `conn.close()` or any other late asyncpg call could
+   still raise the timeout error under 3.14, so the outer except
+   distinguishes that case from a real failure.
+3. `tests/test_eval.py`: the `_MockConnection` gains an `async def
+   close()` no-op, and the six `_run_evaluation_async` tests now
+   patch `make_task_connection` instead of `make_task_pool` and
+   return the bare mock connection (no pool wrapper). The two
+   `get_run` tests still patch `get_pool` (the FastAPI singleton)
+   and remain unchanged in behaviour.
+
+### Why direct connection is safe here
+
+The background task makes exactly two short-lived DB hops (step 1
+status update, step 2 corpus load) and one final write (step 7),
+with several seconds of OpenAI/RAGAS work in between. A pool's job
+is to amortise connect cost across many concurrent SQL ops; this
+function does a handful of statements over a single logical session,
+so a pool was never a strong fit. Single connections also avoid the
+class of bugs where `pool.acquire()`'s `__aexit__` raises - which
+is the original Session C issue and the one the `completed_committed`
+guard was added for.
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 pass.
+- Commit `fix: use direct asyncpg connection in background task to
+  avoid Python 3.14 Task context issue` pushed to `main`; Render
+  redeploys automatically.
+
+### Files in this commit
+
+- `backend/core/database.py`
+- `backend/eval/ragas_runner.py`
+- `tests/test_eval.py` (mock infrastructure mirrors the new code path)
+- `devlog.md`
+
+`tests/test_eval.py` is in the commit even though it was not in the
+explicit `git add` list for this fix - without the mock update,
+pytest would fail because six tests patch a function the production
+code no longer calls. The patch target rename and the `close()` mock
+method are mechanical mirrors of the production change.
+
+### Session H still deferred
+
+Do not start Session H until Render serves the new commit and a
+single probe `/benchmark` confirms the parallel-load Timeout
+traceback is gone.

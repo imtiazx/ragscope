@@ -133,6 +133,15 @@ async def make_task_pool() -> asyncpg.Pool:
     from a different loop raises an event-loop mismatch error. Creating a
     dedicated pool here avoids that entirely.
 
+    NOTE: on Python 3.14 (Render's current runtime), asyncpg.create_pool()
+    internally calls asyncio.timeout() at a point where current_task() can
+    return None under concurrent task creation, causing
+    RuntimeError("Timeout should be used inside a task"). Background tasks
+    in ragas_runner.py therefore use make_task_connection() (below) instead,
+    which opens a single direct connection and avoids the pool initialiser's
+    timeout path. make_task_pool() is kept for tests and any future caller
+    that needs a true pool.
+
     Returns
     -------
     asyncpg.Pool
@@ -144,6 +153,43 @@ async def make_task_pool() -> asyncpg.Pool:
         init=_init_connection,
         statement_cache_size=0,
     )
+
+
+async def make_task_connection() -> asyncpg.Connection:
+    """
+    Open a single direct asyncpg connection for a background task.
+
+    Used by the RAGAS evaluation background task in place of a pool. The
+    connection is the only DB handle the task needs - retrieval, compression,
+    and answer generation make zero DB calls between steps 1-2 and step 7 of
+    the evaluation pipeline, so the overhead of a pool is wasted and its
+    create_pool() initialiser actively misbehaves on Python 3.14.
+
+    Concretely on Python 3.14: asyncpg.create_pool() drives connection setup
+    via asyncio.gather() of multiple sub-coroutines, and asyncpg's compat
+    timeout (which maps to asyncio.timeout() on 3.11+) fails inside those
+    sub-coroutines when current_task() returns None - which happens under
+    parallel task creation against the same event loop. asyncpg.connect()
+    drives its own single coroutine in the caller's Task context and is not
+    affected.
+
+    The codec init that create_pool's `init=` argument would normally run
+    automatically is invoked manually here, so the returned connection
+    decodes JSONB and pgvector columns identically to a pooled connection.
+
+    Returns
+    -------
+    asyncpg.Connection
+        Ready-to-use connection bound to the caller's event loop. The caller
+        owns its lifecycle and must close it via `await conn.close()` when
+        done (typically in a try/finally block).
+    """
+    conn = await asyncpg.connect(
+        **_parse_db_kwargs(),
+        statement_cache_size=0,
+    )
+    await _init_connection(conn)
+    return conn
 
 
 async def close_pool() -> None:

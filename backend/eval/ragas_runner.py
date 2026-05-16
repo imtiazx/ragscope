@@ -43,7 +43,7 @@ import uuid
 from typing import Optional
 
 from backend.core.config import settings
-from backend.core.database import get_pool, make_task_pool
+from backend.core.database import get_pool, make_task_connection
 from backend.llm.openai_provider import OpenAIProvider
 from backend.retrieval.base import RetrievalResult
 from backend.retrieval.registry import registry as retrieval_registry
@@ -412,51 +412,54 @@ async def _run_evaluation_async(
     Parameters match run_evaluation() exactly (corpus is omitted from both
     because it is fetched here from the database rather than passed as an arg).
     """
-    pool = None
+    # Direct asyncpg connection (not a pool). On Python 3.14, asyncpg's
+    # create_pool() initialiser uses asyncio.timeout() at points where
+    # current_task() can return None under concurrent task creation,
+    # raising RuntimeError("Timeout should be used inside a task"). A
+    # single asyncpg.connect() runs entirely inside the caller's Task
+    # context and avoids that path. See backend.core.database.make_task_connection.
+    conn = None
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
     # Tracks whether the final UPDATE that sets status='completed' has been
-    # acked by Postgres. asyncpg's connection-release path uses asyncio.timeout()
-    # in Python 3.11+; if current_task() returns None during release (which can
-    # happen after RAGAS's internal worker coroutines run), the release raises
-    # "Timeout should be used inside a task" AFTER the UPDATE has committed.
-    # The outer except must distinguish that post-commit cleanup noise from a
-    # genuine failure - otherwise it overwrites status='completed' with
-    # status='failed' on a run that actually succeeded.
+    # acked by Postgres. asyncpg's internal teardown can still raise
+    # "Timeout should be used inside a task" AFTER the UPDATE has committed
+    # (e.g. during conn.close()). The outer except must distinguish that
+    # post-commit cleanup noise from a genuine failure - otherwise it would
+    # overwrite status='completed' with status='failed' on a successful run.
     completed_committed = False
 
     try:
-        # Pool creation is inside the try block so that a DB connection failure
-        # is caught and written as status='failed', rather than propagating out
-        # through loop.run_until_complete() and leaving the row permanently stuck
-        # in 'pending'.
-        pool = await make_task_pool()
-        print(f"[DEBUG] pool created run_id={run_id}", flush=True)
+        # Open the dedicated connection inside the try block so that a DB
+        # connect failure is caught and written as status='failed', rather
+        # than propagating out and leaving the row permanently stuck in
+        # 'pending'.
+        conn = await make_task_connection()
+        print(f"[DEBUG] conn opened run_id={run_id}", flush=True)
 
         # Step 1: mark the run as in-progress so the frontend stops showing "pending".
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE benchmark_runs SET status = 'running' WHERE id = $1",
-                run_uuid,
-            )
+        await conn.execute(
+            "UPDATE benchmark_runs SET status = 'running' WHERE id = $1",
+            run_uuid,
+        )
         print(f"[DEBUG] status=running run_id={run_id}", flush=True)
 
-        # Step 2: load the corpus using the task's own pool. The corpus is never
-        # passed as an argument to this function because serialising 100+ chunks
-        # (each carrying a 1536-float embedding) across the thread boundary caused
-        # silent hangs on Render before run_evaluation even began executing.
-        # database.py's load_corpus() uses get_pool() which returns the singleton
-        # bound to the uvloop event loop - unusable here. Query inline instead.
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, content, embedding
-                FROM corpus_chunks
-                WHERE corpus_hash = $1
-                ORDER BY chunk_index
-                """,
-                corpus_hash,
-            )
+        # Step 2: load the corpus on the dedicated connection. The corpus is
+        # never passed as an argument to this function because serialising
+        # 100+ chunks (each carrying a 1536-float embedding) across the
+        # thread boundary caused silent hangs on Render before run_evaluation
+        # even began executing. database.py's load_corpus() uses get_pool()
+        # which returns the singleton bound to the uvloop event loop -
+        # unusable here. Query inline instead.
+        rows = await conn.fetch(
+            """
+            SELECT id, content, embedding
+            FROM corpus_chunks
+            WHERE corpus_hash = $1
+            ORDER BY chunk_index
+            """,
+            corpus_hash,
+        )
         corpus = [
             {
                 "chunk_id": str(row["id"]),
@@ -497,8 +500,9 @@ async def _run_evaluation_async(
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Serialise results for JSONB storage. The JSONB codec on the pool
-        # will call json.dumps automatically, so pass Python dicts/lists directly.
+        # Serialise results for JSONB storage. The JSONB codec on the
+        # connection will call json.dumps automatically, so pass Python
+        # dicts/lists directly.
         retrieved_chunks_data = [
             {
                 "chunk_id": r.chunk_id,
@@ -512,40 +516,33 @@ async def _run_evaluation_async(
         # Step 7: write everything and mark as completed in a single statement
         # so the frontend never sees a partial state where scores are present but
         # status is still 'running'.
-        print(f"[DEBUG] step7 before pool.acquire run_id={run_id}", flush=True)
-        async with pool.acquire() as conn:
-            print(f"[DEBUG] step7 acquired conn run_id={run_id}", flush=True)
-            await conn.execute(
-                """
-                UPDATE benchmark_runs SET
-                    status           = 'completed',
-                    retrieved_chunks = $1,
-                    generated_answer = $2,
-                    faithfulness     = $3,
-                    context_utilization = $4,
-                    answer_relevancy  = $5,
-                    latency_ms        = $6
-                WHERE id = $7
-                """,
-                retrieved_chunks_data,
-                generated_answer,
-                scores["faithfulness"],
-                scores["context_utilization"],
-                scores["answer_relevancy"],
-                latency_ms,
-                run_uuid,
-            )
-            # asyncpg auto-commits single-statement executes, so once execute()
-            # returns the UPDATE is durably persisted. Flag the success
-            # BEFORE leaving the async-with so that if the __aexit__ release
-            # path raises, the outer except still knows the run completed.
-            completed_committed = True
-            print(f"[DEBUG] step7 UPDATE executed (completed_committed=True) run_id={run_id}", flush=True)
-        # Connection has been released back to the pool here. asyncpg uses
-        # asyncio.timeout() during release in Python 3.11+; if current_task()
-        # returns None at this point the release raises "Timeout should be
-        # used inside a task". This print would be skipped if that happens.
-        print(f"[DEBUG] step7 conn released run_id={run_id}", flush=True)
+        print(f"[DEBUG] step7 before UPDATE run_id={run_id}", flush=True)
+        await conn.execute(
+            """
+            UPDATE benchmark_runs SET
+                status           = 'completed',
+                retrieved_chunks = $1,
+                generated_answer = $2,
+                faithfulness     = $3,
+                context_utilization = $4,
+                answer_relevancy  = $5,
+                latency_ms        = $6
+            WHERE id = $7
+            """,
+            retrieved_chunks_data,
+            generated_answer,
+            scores["faithfulness"],
+            scores["context_utilization"],
+            scores["answer_relevancy"],
+            latency_ms,
+            run_uuid,
+        )
+        # asyncpg auto-commits single-statement executes, so once execute()
+        # returns the UPDATE is durably persisted. Set the flag immediately
+        # so any subsequent teardown noise (e.g. conn.close() raising on
+        # 3.14) does not get treated as a real failure by the outer except.
+        completed_committed = True
+        print(f"[DEBUG] step7 UPDATE executed (completed_committed=True) run_id={run_id}", flush=True)
         print(f"[DEBUG] status=completed run_id={run_id}", flush=True)
 
     except BaseException as exc:
@@ -554,9 +551,8 @@ async def _run_evaluation_async(
         # result in a 'failed' row rather than a permanently stuck run.
         # IMPORTANT: if completed_committed is True, the status='completed'
         # UPDATE has already been durably persisted; the exception fired in
-        # the cleanup path (e.g. asyncpg connection release calling
-        # asyncio.timeout() without a current Task). Overwriting status to
-        # 'failed' here would corrupt a successful run, so log-and-swallow.
+        # post-commit cleanup. Overwriting status to 'failed' here would
+        # corrupt a successful run, so log-and-swallow.
         if completed_committed:
             print(
                 f"[DEBUG] post-commit cleanup noise swallowed for run_id={run_id}: "
@@ -574,32 +570,31 @@ async def _run_evaluation_async(
         logger.exception(
             "_run_evaluation_async: run_id=%s failed: %s", run_id, exc
         )
-        if pool is None:
-            # Pool creation itself failed; no DB connection is available to write
-            # the failure status. Log and give up - we cannot do anything else
-            # from a background thread without a pool.
+        if conn is None:
+            # Connection open itself failed; no DB handle is available to
+            # write the failure status. Log and give up - we cannot do
+            # anything else from a background thread without a connection.
             print(
-                f"[DEBUG] pool is None for run_id={run_id}, skipping DB failure write",
+                f"[DEBUG] conn is None for run_id={run_id}, skipping DB failure write",
                 flush=True,
             )
             logger.error(
-                "_run_evaluation_async: pool is None for run_id=%s,"
+                "_run_evaluation_async: conn is None for run_id=%s,"
                 " cannot write failed status",
                 run_id,
             )
         else:
             try:
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE benchmark_runs SET
-                            status        = 'failed',
-                            error_message = $1
-                        WHERE id = $2
-                        """,
-                        str(exc),
-                        run_uuid,
-                    )
+                await conn.execute(
+                    """
+                    UPDATE benchmark_runs SET
+                        status        = 'failed',
+                        error_message = $1
+                    WHERE id = $2
+                    """,
+                    str(exc),
+                    run_uuid,
+                )
             except Exception:
                 logger.exception(
                     "_run_evaluation_async: could not write failed status to DB"
@@ -608,24 +603,24 @@ async def _run_evaluation_async(
                 )
 
     finally:
-        if pool is not None:
-            print(f"[DEBUG] finally: before pool.close run_id={run_id}", flush=True)
+        if conn is not None:
+            print(f"[DEBUG] finally: before conn.close run_id={run_id}", flush=True)
             try:
-                await pool.close()
-                print(f"[DEBUG] finally: pool.close ok run_id={run_id}", flush=True)
+                await conn.close()
+                print(f"[DEBUG] finally: conn.close ok run_id={run_id}", flush=True)
             except BaseException as close_exc:
-                # pool.close() can itself raise "Timeout should be used inside
-                # a task" if asyncpg's per-connection teardown calls
-                # asyncio.timeout() outside a Task context. Log and swallow
-                # so the function still returns cleanly; the row is already in
+                # conn.close() can itself raise "Timeout should be used
+                # inside a task" if asyncpg's teardown calls asyncio.timeout()
+                # outside a Task context on Python 3.14. Log and swallow so
+                # the function still returns cleanly; the row is already in
                 # its final state (completed or failed) at this point.
                 print(
-                    f"[DEBUG] finally: pool.close RAISED "
+                    f"[DEBUG] finally: conn.close RAISED "
                     f"{type(close_exc).__name__}: {close_exc} run_id={run_id}",
                     flush=True,
                 )
                 logger.exception(
-                    "_run_evaluation_async: pool.close failed for run_id=%s",
+                    "_run_evaluation_async: conn.close failed for run_id=%s",
                     run_id,
                 )
         print(f"[DEBUG] _run_evaluation_async: finally block done run_id={run_id}", flush=True)
