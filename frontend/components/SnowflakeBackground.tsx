@@ -9,8 +9,6 @@
  *
  * Color: teal (#14b8a6) at varying opacity to create depth. The effect
  * is intentionally subtle so it does not compete with page content.
- *
- * Exported as ShootingStars so no import changes are needed in page.tsx.
  */
 
 import { useEffect, useRef } from 'react'
@@ -68,7 +66,7 @@ function makeParticle(w: number, h: number, offscreen = false): Particle {
 // Component
 // ---------------------------------------------------------------------------
 
-export default function ShootingStars() {
+export default function SnowflakeBackground() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {

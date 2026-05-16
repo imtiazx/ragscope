@@ -328,3 +328,70 @@ architecture decision (one run_id per strategy, streamed independently).
 - Backend still inlines fingerprint computation in `benchmark.py` while
   `/chat` uses `get_fingerprint_hash`. Could refactor benchmark.py to
   use the same dependency; not done here.
+
+## 2026-05-16 - Session G: deploy hygiene and ready for Session H
+
+Five cleanup items before the Session H benchmark sweep. All independent.
+
+### What landed
+
+1. **`render.yaml`** (new at repo root). Declares the `ragscope-backend`
+   web service for Render. Build: `pip install -r requirements.txt`.
+   Start: `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`. Plan
+   `free`. Eight envVar entries with `sync: false` so values stay in the
+   Render dashboard and never get committed: `OPENAI_API_KEY`,
+   `SUPABASE_URL`, `SUPABASE_KEY`, `LANGCHAIN_API_KEY`,
+   `LANGCHAIN_TRACING_V2`, `LANGCHAIN_PROJECT`, `DEV_TOKEN`,
+   `MAX_FILE_SIZE_BYTES`. Comments call out the free-tier spin-down
+   characteristic.
+2. **`README.md`** (new at repo root). Seven sections in sentence case:
+   what RAGScope is, live links, retrieval strategies (four methods
+   listed plus contextual compression flagged separately as a
+   post-retrieval processor), evaluation metrics (faithfulness,
+   context utilization, answer relevancy), access tiers (Guest, BYOK,
+   Dev), local dev setup (commands lifted verbatim from CLAUDE.md),
+   stack. No em-dashes, no emoji.
+3. **CORS** in `backend/main.py`. `allow_origins` tightened from `["*"]`
+   to the two trusted origins:
+   `["https://ragscope.vercel.app", "http://localhost:3000"]`. Comment
+   updated to explain why the wildcard would be unsafe with
+   `allow_credentials=True`.
+4. **Landing page copy fix** in `frontend/app/page.tsx`. The
+   `WHY_ITEMS[0].body` blurb said "Context precision measures whether
+   the retrieved chunks were relevant" - replaced with "Context
+   utilization" so the marketing copy matches the metric name used
+   everywhere else (RAGAS code, /strategies API, docs page, results
+   dashboard).
+5. **`ShootingStars.tsx` -> `SnowflakeBackground.tsx`**.
+   `git mv frontend/components/ShootingStars.tsx
+   frontend/components/SnowflakeBackground.tsx`. The component function
+   inside also renamed from `ShootingStars` to `SnowflakeBackground`.
+   The stale "Exported as ShootingStars" line in the module docstring
+   removed. `frontend/app/page.tsx` import path and JSX usage updated
+   in lockstep. Implementation untouched - particles still drift down
+   with sine-wave horizontal oscillation, no streaking.
+
+### Build and test
+
+- `python -m pytest`: 106 / 106 pass after the CORS change.
+- `npm run build`: clean exit 0, all 6 pages prerendered, `/app` 127 kB
+  (unchanged from post-Session-E baseline).
+- Em-dash scan on `render.yaml`, `README.md`, `backend/main.py`, and
+  `frontend/components/SnowflakeBackground.tsx`: clean.
+- `grep "ShootingStars" frontend/`: no matches.
+- `grep "Context precision" frontend/app/page.tsx`: no matches.
+
+### Ready for Session H
+
+The project is now in a publishable state for the benchmark sweep:
+- Backend has a Render service spec, tightened CORS, and a chat endpoint.
+- Frontend builds cleanly with multi-strategy selection and streaming
+  results, snowflake background named correctly, and metric copy
+  consistent with the rest of the app.
+- README at repo root explains the project to a first-time visitor.
+- All 106 tests green.
+
+Session H can now run the 10 motor-vehicle benchmark questions across
+all four retrieval strategies. The corresponding session entry should
+record the strategy that wins on weighted-average across the question
+set.

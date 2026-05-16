@@ -62,11 +62,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: allow all origins for now. Tighten to specific frontend domains before
-# production by replacing allow_origins=["*"] with the Vercel deployment URL.
+# CORS: restricted to the production Vercel frontend and the local Next.js dev
+# server. Wildcard ("*") is intentionally NOT used here because it would let any
+# origin make credentialed requests to the API, including BYOK token exfiltration
+# attempts from a third-party page that loaded our endpoints. Add a new origin
+# only when a new official frontend deployment is brought online.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://ragscope.vercel.app",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

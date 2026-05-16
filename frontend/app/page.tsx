@@ -18,7 +18,7 @@ import { motion } from 'framer-motion'
 import Link from 'next/link'
 import { ArrowRight, BarChart2, FlaskConical, Layers } from 'lucide-react'
 import Nav from '@/components/Nav'
-import ShootingStars from '@/components/ShootingStars'
+import SnowflakeBackground from '@/components/SnowflakeBackground'
 
 /** Shared variants for scroll-triggered reveals on every section below the hero. */
 const revealVariants = {
@@ -33,7 +33,7 @@ const WHY_ITEMS = [
   {
     number: '01',
     title: 'Three metrics that tell the full story',
-    body: 'Faithfulness measures whether the answer is grounded in your documents. Context precision measures whether the retrieved chunks were relevant. Answer relevancy measures whether the answer addressed the question. Most RAG evaluations ignore at least one of these. RAGScope scores all three.',
+    body: 'Faithfulness measures whether the answer is grounded in your documents. Context utilization measures whether the retrieved chunks were relevant. Answer relevancy measures whether the answer addressed the question. Most RAG evaluations ignore at least one of these. RAGScope scores all three.',
   },
   {
     number: '02',
@@ -76,7 +76,7 @@ export default function LandingPage() {
        * Shooting stars canvas -- fixed so it covers the entire page scroll
        * including all sections below the hero fold.
        */}
-      <ShootingStars />
+      <SnowflakeBackground />
 
       {/*
        * CSS grid overlay -- sits above the canvas, below all content.
