@@ -105,14 +105,25 @@ def _run_ragas(
     contexts: list[str],
 ) -> dict:
     """
-    Run RAGAS evaluation and return the three metric scores.
+    Run RAGAS evaluation one metric at a time and return all three scores.
+
+    Each metric is evaluated in its own ragas_evaluate() call wrapped in
+    try/except BaseException. A failure in one metric (e.g. an internal
+    asyncio.timeout() raise when current_task() returns None inside a RAGAS
+    worker thread) records NaN for that metric and continues to the next,
+    rather than aborting the whole evaluation. NaN values are stored in
+    Postgres as 'NaN'::float8 and JSON-serialised as null when returned by
+    the results endpoint.
+
+    Detailed [DEBUG] print probes surround each per-metric call so Render
+    stderr shows exactly which metric raised, and what asyncio.current_task()
+    returned at that moment - the failure mode the previous unified call
+    masked because RAGAS itself does not re-raise (raise_exceptions=False).
 
     Imports RAGAS and its datasets dependency lazily so this module is
     importable without those packages installed (tests mock this function).
     Declared as a regular (non-async) function because it runs inside
-    _run_evaluation_async on a plain asyncio event loop. RAGAS makes its
-    own OpenAI calls via the openai SDK (not httpx.AsyncClient), so it does
-    not encounter the anyio task scope requirement that breaks AsyncClient.
+    _run_evaluation_async on a plain asyncio event loop.
 
     The OpenAI API key is written to os.environ here because RAGAS reads it
     via its langchain dependency. This is the only place in the codebase that
@@ -131,7 +142,9 @@ def _run_ragas(
     Returns
     -------
     dict
-        Keys: faithfulness, context_utilization, answer_relevancy (all float).
+        Keys: faithfulness, context_utilization, answer_relevancy. Each value
+        is a float; metrics whose individual ragas_evaluate() call raised
+        BaseException are returned as float('nan').
     """
     import os
     # RAGAS reads the key from the environment via its langchain integration.
@@ -157,33 +170,69 @@ def _run_ragas(
         "contexts": [contexts],
     })
 
-    # Call ragas_evaluate synchronously. asyncio.to_thread() was previously
-    # used here to avoid blocking the FastAPI main event loop, but run_evaluation
-    # now drives _run_evaluation_async via loop.run_until_complete() in a
-    # dedicated background thread - so this event loop has no other coroutines
-    # to starve. Dispatching to a second thread via asyncio.to_thread() creates
-    # a new worker thread with no event loop; RAGAS and its langchain/nest_asyncio
-    # internals call asyncio.get_event_loop() from that thread, which raises
-    # RuntimeError on Python 3.12+. Calling synchronously keeps everything on
-    # the same thread where the event loop has already been set up.
-    def _sync_eval():
-        return ragas_evaluate(
-            dataset,
-            metrics=[
-                ragas_faithfulness,
-                ragas_context_utilization,
-                ragas_answer_relevancy,
-            ],
+    # Confirm we are inside an asyncio Task at entry. The outer wrapper
+    # (run_evaluation -> loop.create_task -> loop.run_until_complete) should
+    # guarantee this; if current_task() is None here, the task wrapper is
+    # not propagating and the asyncio.timeout() calls inside RAGAS / asyncpg
+    # are doomed.
+    try:
+        entry_task = asyncio.current_task()
+    except RuntimeError:
+        entry_task = None
+    print(
+        f"[DEBUG] _run_ragas: entry asyncio.current_task() = {entry_task!r}",
+        flush=True,
+    )
+
+    # Per-metric ordered list. Evaluating one metric per ragas_evaluate() call
+    # isolates failures: if context_utilization crashes inside RAGAS, faithfulness
+    # and answer_relevancy still get computed.
+    metric_defs = [
+        ("faithfulness", ragas_faithfulness),
+        ("context_utilization", ragas_context_utilization),
+        ("answer_relevancy", ragas_answer_relevancy),
+    ]
+
+    scores: dict[str, float] = {}
+
+    for key, metric in metric_defs:
+        # Re-check current_task() before each metric so logs show whether the
+        # task context survives across iterations or gets torn down by RAGAS
+        # internals partway through the loop.
+        try:
+            pre_task = asyncio.current_task()
+        except RuntimeError:
+            pre_task = None
+        print(
+            f"[DEBUG] _run_ragas: about to evaluate {key!r}, "
+            f"current_task() = {pre_task!r}",
+            flush=True,
         )
 
-    result = _sync_eval()
-    print("[DEBUG] ragas_evaluate() call returned", flush=True)
+        try:
+            result = ragas_evaluate(dataset, metrics=[metric])
+            value = float(result[key])
+            scores[key] = value
+            print(
+                f"[DEBUG] _run_ragas: {key} = {value}",
+                flush=True,
+            )
+        except BaseException as exc:
+            # Catch BaseException so SystemExit / KeyboardInterrupt / GeneratorExit
+            # also get logged-and-NaN rather than aborting the whole pipeline.
+            # The "Timeout should be used inside a task" RuntimeError raised by
+            # asyncio.timeout() in RAGAS worker coroutines is captured here.
+            print(
+                f"[DEBUG] _run_ragas: {key} RAISED {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            logger.exception(
+                "_run_ragas: metric %s raised %s", key, type(exc).__name__
+            )
+            scores[key] = float("nan")
 
-    return {
-        "faithfulness": float(result["faithfulness"]),
-        "context_utilization": float(result["context_utilization"]),
-        "answer_relevancy": float(result["answer_relevancy"]),
-    }
+    print(f"[DEBUG] _run_ragas: returning scores = {scores}", flush=True)
+    return scores
 
 
 def _row_to_dict(row) -> dict:
@@ -454,7 +503,9 @@ async def _run_evaluation_async(
         # Step 7: write everything and mark as completed in a single statement
         # so the frontend never sees a partial state where scores are present but
         # status is still 'running'.
+        print(f"[DEBUG] step7 before pool.acquire run_id={run_id}", flush=True)
         async with pool.acquire() as conn:
+            print(f"[DEBUG] step7 acquired conn run_id={run_id}", flush=True)
             await conn.execute(
                 """
                 UPDATE benchmark_runs SET
@@ -475,6 +526,12 @@ async def _run_evaluation_async(
                 latency_ms,
                 run_uuid,
             )
+            print(f"[DEBUG] step7 UPDATE executed run_id={run_id}", flush=True)
+        # Connection has been released back to the pool here. asyncpg uses
+        # asyncio.timeout() during release in Python 3.11+; if current_task()
+        # returns None at this point the release raises "Timeout should be
+        # used inside a task". This print would be skipped if that happens.
+        print(f"[DEBUG] step7 conn released run_id={run_id}", flush=True)
         print(f"[DEBUG] status=completed run_id={run_id}", flush=True)
 
     except BaseException as exc:
@@ -520,7 +577,25 @@ async def _run_evaluation_async(
 
     finally:
         if pool is not None:
-            await pool.close()
+            print(f"[DEBUG] finally: before pool.close run_id={run_id}", flush=True)
+            try:
+                await pool.close()
+                print(f"[DEBUG] finally: pool.close ok run_id={run_id}", flush=True)
+            except BaseException as close_exc:
+                # pool.close() can itself raise "Timeout should be used inside
+                # a task" if asyncpg's per-connection teardown calls
+                # asyncio.timeout() outside a Task context. Log and swallow
+                # so the function still returns cleanly; the row is already in
+                # its final state (completed or failed) at this point.
+                print(
+                    f"[DEBUG] finally: pool.close RAISED "
+                    f"{type(close_exc).__name__}: {close_exc} run_id={run_id}",
+                    flush=True,
+                )
+                logger.exception(
+                    "_run_evaluation_async: pool.close failed for run_id=%s",
+                    run_id,
+                )
         print(f"[DEBUG] _run_evaluation_async: finally block done run_id={run_id}", flush=True)
 
 
