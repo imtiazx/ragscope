@@ -395,3 +395,197 @@ Session H can now run the 10 motor-vehicle benchmark questions across
 all four retrieval strategies. The corresponding session entry should
 record the strategy that wins on weighted-average across the question
 set.
+
+## 2026-05-16 - Session H: motor vehicle benchmark sweep (BLOCKED)
+
+Attempted but did not complete. The 40-run sweep collected effectively
+no data because the Render free-tier backend went into a state where
+new POST /benchmark calls were accepted but their background tasks
+never executed. Status stayed at `pending` indefinitely and the
+post-Session-C `status='running'` transition never fired, which means
+the failure is upstream of any of the recent fixes - the worker
+thread never even called the first asyncpg statement.
+
+### What I attempted
+
+1. Created `/tmp/motor_vehicles.txt`, an 865-word corpus covering the
+   ten topics the questions ask about (four-stroke engine, brakes,
+   turbocharger, transmission, regen, knocking, fuel injection,
+   catalytic converter, traction vs stability, maintenance intervals).
+2. POST /ingest at 18:13 succeeded:
+   `corpus_hash=f5c424afb759acb74477baa0c3babfb40930dad0129a95507e96e26a46ea0e93`,
+   `chunk_count=2`. (Default chunker produces 2 chunks at 512-token
+   chunk_size for 865 words; fewer than the target 3-5 but enough for
+   the strategies to be exercised.)
+3. Wrote a Python runner at `/tmp/session_h_runner.py` that POSTs one
+   /benchmark per (question, strategy) pair, polls GET /results every
+   5 s up to 300 s, then appends a CSV row. Dev token bypass via
+   `X-Dev-Token: imtiazx` header.
+4. First runner attempt (18:16-18:22): Q1/naive completed in 89.7 s
+   (faithfulness 1.0, context_utilization 0.99999..., answer_relevancy
+   0.926). Q1/hyde polling hit the original 200 s timeout. Killed the
+   runner, extended polling to 300 s, restarted.
+5. Second runner attempt (18:23-22:00, ~3.5 h): all 40 runs hit the
+   300 s polling timeout. CSV: 40 rows, all `status=timeout`, every
+   metric column empty.
+
+### Diagnosis (no Render log access from this session)
+
+Probed the backend directly after the second attempt finished:
+
+- `/health` returns 200 in ~280 ms.
+- `/strategies` returns the expected registry payload.
+- A fresh `POST /benchmark` returns 202 with a run_id immediately.
+- `GET /results/<run_id>` returns `status=pending` and stays there
+  for the full 300 s I polled - no transition to `running`.
+
+`status=pending` (not `running`) means `_run_evaluation_async`'s very
+first `pool = await make_task_pool()` was never reached either, so:
+
+- It is not a per-metric RAGAS issue (Session C territory) - the
+  background task never got far enough to call RAGAS.
+- It is not the asyncpg post-commit cleanup noise (Session C, second
+  fix) - same reason.
+- It is something earlier in the dispatch path: either anyio's worker
+  thread pool is exhausted from prior hung tasks, the worker is
+  pinned by an OS-level issue, or Render's free-tier instance is in
+  a degraded state that lets requests in but cannot fork worker
+  threads.
+
+The first run of Session H (Q1/naive 89.7 s) succeeded, then every
+later run stuck. That pattern matches "one worker thread successfully
+runs, gets stuck somewhere on exit, all subsequent dispatches queue
+behind it". A likely candidate is the asyncpg pool created by
+`make_task_pool()` hanging on its TCP connect to Supabase due to a
+Render-side network issue; if the connect never errors and never
+completes, the background thread holds onto its worker forever.
+
+### Partial data (one data point only)
+
+| Question | Strategy | Status | Faithfulness | Context util. | Answer rel. | Latency |
+|----------|----------|--------|--------------|---------------|-------------|---------|
+| Q1 | naive | completed | 1.0 | 0.99999... | 0.9262 | 89.7 s |
+
+Everything else: `timeout`, no metric data.
+
+### Why no summary table or winner
+
+A weighted-average ranking across one out of forty data points is
+meaningless. Reporting a "winner" from a sample of one would be
+misleading. The user's stated success criterion ("table showing
+average ... per strategy across all 10 questions") cannot be honestly
+satisfied from the data this session collected.
+
+### What would unblock a retry
+
+1. Force a Render redeploy by pushing any commit to `main` (an empty
+   `git commit --allow-empty -m "kick render"` is enough). The
+   redeploy resets all worker threads and connection pools. The first
+   benchmark after the redeploy will land on a clean worker. This
+   step requires explicit user authorisation per the project rule
+   that commits and pushes must be requested.
+2. Optionally upgrade Render from free to a paid tier so workers do
+   not spin down and so resource limits are higher. Free-tier compute
+   has been the recurring infrastructure constraint in this project.
+3. Re-run `/tmp/session_h_runner.py` against the same `corpus_hash`
+   immediately after the redeploy lands (commit hash is visible in
+   the `X-Render-Version` response header if Render emits one;
+   otherwise wait the documented 2-3 min redeploy window from
+   Session C).
+4. Consider running fewer than 40 runs per session to fit inside the
+   Render free-tier worker capacity, e.g. one question at a time, or
+   spreading the 40 runs across multiple sessions with redeploy
+   between batches.
+
+### Files touched
+
+- `/tmp/motor_vehicles.txt` (temporary corpus)
+- `/tmp/session_h_runner.py` (temporary runner)
+- `/tmp/session_h_results.csv` (40 timeout rows)
+- `/tmp/session_h_log.txt` (runner log)
+- `devlog.md` (this entry)
+
+No project files were modified. No commits made.
+
+## 2026-05-16 - Python 3.14 asyncpg Task-context diagnostic
+
+Render produced a clean traceback that explains why the Session H
+backend got stuck at `status=pending` across every benchmark. On
+Python 3.14:
+
+```
+File "ragas_runner.py", line 433, in _run_evaluation_async
+    pool = await make_task_pool()
+File "database.py", line 142, in make_task_pool
+    return await asyncpg.create_pool(
+File "asyncpg/pool.py", line 418, in __async_init__
+    await self._initialize()
+File "asyncpg/connection.py", line 2420, in connect
+    async with compat.timeout(timeout):
+RuntimeError: Timeout should be used inside a task
+```
+
+`asyncpg.create_pool()` calls into `connection.connect()` which uses
+`compat.timeout()`. On Python 3.14 `compat.timeout` is
+`asyncio.timeout`, which raises `RuntimeError("Timeout should be used
+inside a task")` when `asyncio.current_task()` returns None at the
+point the context manager is entered.
+
+The current `run_evaluation()` wrapper already uses
+`loop.run_until_complete(loop.create_task(_run_evaluation_async(...)))`
+which is the documented fix for the outer Task context (introduced in
+commit `e7a69c5`). If that wrapping is correctly propagated to the
+coroutine then `asyncio.current_task()` inside `_run_evaluation_async`
+should return the outer Task and asyncpg should be happy. The fact
+that it is NOT happy on Python 3.14 means one of two things:
+
+1. **Outer Task wrapping is not propagating on 3.14.** Some change
+   between 3.11/3.12 and 3.14 in how `loop.create_task()` interacts
+   with `loop.run_until_complete()` causes `current_task()` to be None
+   inside the coroutine. Unlikely but possible.
+2. **asyncpg's internal coroutines escape the outer Task context.**
+   `pool._initialize()` uses `asyncio.gather()` to set up connections
+   in parallel; on Python 3.14 those gathered sub-coroutines may not
+   inherit a Task identity in the way asyncpg's `compat.timeout`
+   expects. This is the more likely culprit.
+
+### Diagnostic change made this session
+
+Added an explicit `assert asyncio.current_task() is not None` at the
+top of `_run_evaluation_async`, immediately before any asyncpg call,
+plus a `[DEBUG] _run_evaluation_async ENTRY ... current_task=...`
+print that fires the moment the coroutine starts. The next Render
+benchmark run will surface one of two outcomes in the logs:
+
+- The assert fires (or the print shows `current_task=None`): outer
+  Task wrapping is broken on 3.14 and we need a new approach for the
+  background-task event loop.
+- The print shows a non-None Task but the original `Timeout should be
+  used inside a task` from asyncpg still appears: asyncpg internals
+  are the source. Fix paths from there include wrapping the
+  `make_task_pool()` call in its own `asyncio.create_task()` to give
+  asyncpg a fresh inner Task to attach to, pinning `asyncpg` to a
+  version that does not rely on `asyncio.timeout`, or pinning the
+  Render runtime to Python 3.11 / 3.12 via `runtime.txt` until the
+  asyncpg side is fixed upstream.
+
+### Files
+
+- `backend/eval/ragas_runner.py`: added the assert + entry print to
+  `_run_evaluation_async`. No other changes.
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 pass. The local Python 3.11 test
+  environment always sets `current_task()` (pytest-asyncio drives
+  coroutines as Tasks), so the assert is a no-op here. It only
+  surfaces useful information on Render.
+- Commit + push triggered Render redeploy so the next /benchmark hit
+  will produce the diagnostic logs.
+
+### Session H not retried
+
+Session H remains blocked pending the next round of Render-log data.
+The 40-run sweep is not attempted until either the assert tells us
+the outer Task wrapping is broken (fix that first) or it confirms the
+wrapping is fine and we move on to the asyncpg-internals fix.

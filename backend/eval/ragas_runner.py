@@ -412,6 +412,28 @@ async def _run_evaluation_async(
     Parameters match run_evaluation() exactly (corpus is omitted from both
     because it is fetched here from the database rather than passed as an arg).
     """
+    # Diagnostic: confirm we are running inside an asyncio Task before any
+    # asyncpg call. asyncpg.create_pool() internally calls asyncio.timeout()
+    # on Python 3.11+; on Python 3.14 (Render's current runtime) this raises
+    # RuntimeError("Timeout should be used inside a task") if
+    # asyncio.current_task() returns None. The run_evaluation() wrapper above
+    # is supposed to guarantee a Task via loop.create_task() before driving
+    # the coroutine, so this should always be non-None. If the assert fires
+    # on Render the wrapping is broken; if it does NOT fire but
+    # make_task_pool() still raises the same RuntimeError, then asyncpg
+    # internals are escaping the outer Task context (a different fix path).
+    entry_task = asyncio.current_task()
+    print(
+        f"[DEBUG] _run_evaluation_async ENTRY run_id={run_id} "
+        f"current_task={entry_task!r}",
+        flush=True,
+    )
+    assert entry_task is not None, (
+        "_run_evaluation_async must run inside an asyncio Task. "
+        "If this fires on Render, the run_evaluation() Task wrapper is not "
+        "propagating to the coroutine on Python 3.14."
+    )
+
     pool = None
     t0 = time.perf_counter()
     run_uuid = uuid.UUID(run_id)
