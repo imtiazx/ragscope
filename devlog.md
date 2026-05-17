@@ -1278,4 +1278,31 @@ The user still needs to:
 5. Update `README.md` live-links section with the final Railway URL
    once the service is live.
 
+### Parallel probe against the live Railway backend
+
+After the deploy went up at
+`https://ragscope-backend-production.up.railway.app` the parallel probe
+in `tests/parallel_probe.py` was run end to end. It ingested a four
+sentence corpus about water, fired a single `POST /benchmark` carrying
+all four strategies, then polled the four returned run_ids in parallel
+with a `ThreadPoolExecutor` until every run hit a terminal state.
+
+```
+strategy     status     faithfulness   ctx_util   ans_rel    latency_ms
+-------------------------------------------------------------------------
+naive        completed  1.0000         1.0000     1.0000     61734.3322
+hyde         completed  1.0000         1.0000     1.0000     61459.7469
+multiquery   completed  1.0000         1.0000     1.0000     62070.3867
+hybrid       completed  1.0000         1.0000     1.0000     60347.9499
+```
+
+All four strategies reached `status=completed`. All three RAGAS metrics
+came back non null on every run, exceeding the at least two of three
+threshold the probe asserts. Overall result: PASS.
+
+This confirms that the per metric isolation pattern and the psycopg2
+sync connection in the background task work correctly on Railway under
+parallel load, which is the failure mode Render's Python 3.14 image
+produced. Session I is complete.
+
 No project files modified. No commits made.
