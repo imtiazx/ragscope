@@ -907,3 +907,30 @@ Do not start Session H. Wait for the user to confirm the redeploy is
 live on `main` and that a parallel-load probe shows no asyncio.timeout
 traceback in Render logs (it shouldn't appear at all - psycopg2 never
 imports asyncio.timeout).
+
+## 2026-05-17 - psycopg2 UUID adapter + defensive str() cast
+
+The first parallel probe against commit `1911bf9` (psycopg2 background
+task) left all 4 runs stuck at `status=pending` with `error_message=null`,
+which means the background task crashed before reaching its first
+`status='running'` write. Most plausible cause: psycopg2 not knowing
+how to serialise the `run_uuid` parameter on Render's image.
+
+### Changes
+
+- `backend/core/database.py:make_sync_connection`: calls
+  `psycopg2.extras.register_uuid()` once (process-global) before
+  `psycopg2.connect()`. This registers psycopg2's built-in UUID adapter
+  so `uuid.UUID` parameters round-trip without manual casts.
+- `backend/eval/ragas_runner.py`: every `cur.execute()` call that
+  bound `run_uuid` as a parameter now binds `str(run_uuid)` instead.
+  Belt-and-suspenders alongside the global adapter: if `register_uuid`
+  is a no-op on a given environment, the cast guarantees the parameter
+  travels as the canonical hyphenated UUID text form, which Postgres'
+  UUID column accepts directly.
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 pass.
+- Commit `fix: register psycopg2 UUID adapter and cast run_id to str`
+  pushed; Render redeploys.

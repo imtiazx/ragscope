@@ -249,7 +249,13 @@ def make_sync_connection():
     # Lazy imports so test environments without psycopg2 / pgvector
     # installed do not fail to load this module.
     import psycopg2
+    import psycopg2.extras
     from pgvector.psycopg2 import register_vector
+
+    # Register a process-global UUID adapter so psycopg2 can serialise
+    # uuid.UUID parameters without per-call str() casts. Safe to call
+    # multiple times; subsequent calls are effectively idempotent.
+    psycopg2.extras.register_uuid()
 
     parsed = urlparse(settings.supabase_url)
     host = parsed.hostname or ""

@@ -445,10 +445,15 @@ async def _run_evaluation_async(
         print(f"[DEBUG] conn opened run_id={run_id}", flush=True)
 
         # Step 1: mark the run as in-progress so the frontend stops showing "pending".
+        # run_uuid is wrapped in str() as a defensive cast: psycopg2 should
+        # auto-adapt uuid.UUID via the global codec registered in
+        # make_sync_connection, but on environments where that registration
+        # silently fails the str() cast guarantees Postgres receives the
+        # canonical hyphenated UUID text form, which the UUID column accepts.
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE benchmark_runs SET status = 'running' WHERE id = %s",
-                (run_uuid,),
+                (str(run_uuid),),
             )
         conn.commit()
         print(f"[DEBUG] status=running run_id={run_id}", flush=True)
@@ -555,7 +560,7 @@ async def _run_evaluation_async(
                     scores["context_utilization"],
                     scores["answer_relevancy"],
                     latency_ms,
-                    run_uuid,
+                    str(run_uuid),
                 ),
             )
         conn.commit()
@@ -614,7 +619,7 @@ async def _run_evaluation_async(
                             error_message = %s
                         WHERE id = %s
                         """,
-                        (str(exc), run_uuid),
+                        (str(exc), str(run_uuid)),
                     )
                 conn.commit()
             except Exception:
