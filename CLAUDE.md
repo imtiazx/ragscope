@@ -26,8 +26,11 @@ This is NOT an agentic system. It is a deterministic evaluation pipeline.
 - Outbound HTTP: httpx (async, used in all LLM provider classes)
 - Tracing: LangSmith via langsmith package only (no langchain-core dependency)
 - Frontend: Next.js 14, Tailwind CSS, recharts, framer-motion, shadcn/ui
-- Deployment: Railway (backend, primary host), Vercel (frontend), Supabase (DB).
-  Required deploy files at repo root: Dockerfile, railway.toml.
+- Deployment:
+  - Backend: Railway free tier, Dockerized, python:3.11.9-slim base image - LIVE at ragscope-backend-production.up.railway.app
+  - Frontend: Vercel free tier - LIVE at ragscope.vercel.app
+  - Database: Supabase free tier - LIVE
+  - Required deploy files at repo root: Dockerfile, railway.toml.
 
 ---
 
@@ -458,3 +461,14 @@ LANGCHAIN_TRACING_V2=true
 LANGCHAIN_PROJECT=ragscope
 DEV_TOKEN=imtiazx           # dev bypass token - never commit the actual value
 MAX_FILE_SIZE_BYTES=10485760  # 10MB combined limit across all uploaded files
+
+---
+
+## Pending future sessions
+
+Session J: progress bar / SSE streaming during RAGAS evaluation (UX enhancement)
+Session K: BYOK unlimited chat (route direct to provider, bypass backend chat_count)
+Session L: remove debug print probes from benchmark.py, final README polish
+Session M: thorough dev token (imtiazx) end-to-end app review and UI polish
+
+
