@@ -8,8 +8,8 @@ for your data.
 ## Live links
 
 - Frontend: https://ragscope.vercel.app
-- Backend API: https://ragscope-backend.onrender.com
-- API docs (FastAPI auto-generated): https://ragscope-backend.onrender.com/docs
+- Backend API: hosted on Railway (URL set after deploy)
+- API docs (FastAPI auto-generated): `<railway-backend-url>/docs`
 
 ## Retrieval strategies
 
@@ -94,5 +94,38 @@ Run `npm run build` in `frontend/` to produce a production build.
 - Outbound HTTP: httpx, both async and blocking variants
 - Tracing: LangSmith via the langsmith package (no langchain-core dependency)
 - Frontend: Next.js 14, Tailwind CSS, recharts, framer-motion, shadcn/ui
-- Deployment: Render for the backend, Vercel for the frontend, Supabase for
-  the database
+- Deployment: Railway for the backend (primary host), Vercel for the
+  frontend, Supabase for the database
+
+## Backend deployment
+
+Railway is the current backend host. The service runs the FastAPI app inside
+a Docker container built from the `Dockerfile` at the repo root, pinned to
+Python 3.11 (3.11.9-slim). Render was the previous host but is now
+deprecated: Render's image runtime moved to Python 3.14, which broke RAGAS
+0.1.21 because asyncpg's connect path calls `asyncio.timeout()` in a way
+that is incompatible with Python 3.14 under parallel load.
+
+### Local Docker test
+
+Build the image and run it locally before pushing to Railway:
+
+```
+docker build -t ragscope-backend-test .
+docker run --rm -p 8001:8000 --env-file .env ragscope-backend-test
+curl http://localhost:8001/health
+```
+
+The `/health` endpoint should return a JSON body containing `"status": "ok"`.
+
+### Railway deploy steps
+
+1. Create a new Railway project and connect this GitHub repo.
+2. Railway auto-detects the `Dockerfile` and `railway.toml` at the repo root
+   and uses them for build and deploy.
+3. Add every environment variable listed in `.env.example` via the Railway
+   service "Variables" tab. Railway injects `PORT` automatically; the
+   `startCommand` in `railway.toml` binds to it.
+4. Trigger a deploy. The healthcheck path is `/health` with a 300 second
+   timeout, so the first cold boot has enough room to create database
+   tables before the probe gives up.

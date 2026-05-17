@@ -72,6 +72,7 @@ app.add_middleware(
     allow_origins=[
         "https://ragscope.vercel.app",
         "http://localhost:3000",
+        "https://*.railway.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],

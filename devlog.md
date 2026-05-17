@@ -1208,4 +1208,74 @@ returned real scores, so the issue is environmental, not code.
 - `/tmp/session_h_local_log.txt` - per-batch summary log with timestamps.
 - `devlog.md` - this entry.
 
+---
+
+## 2026-05-18 - Session I: Railway migration
+
+### Summary
+
+Migrated backend hosting target from Render to Railway. No backend logic
+was changed in this session; the work is pure infrastructure plus the
+config and documentation updates that depend on it. Render is now marked
+deprecated, with its config file kept in the repo for reference only.
+
+### Why Railway
+
+Render's image runtime moved to Python 3.14, which broke RAGAS 0.1.21
+under parallel background-task load. asyncpg's connect path calls
+`asyncio.timeout()` in a way that is incompatible with Python 3.14 and
+crashed the eval workers silently. Pinning Python in the Render image
+was not a clean option, so the backend now ships as a Docker image
+pinned to `python:3.11.9-slim` and Railway is the new host.
+
+### Changes
+
+- `Dockerfile` (new, repo root). FROM `python:3.11.9-slim`, installs
+  `libpq-dev` and `gcc` for psycopg2, `pip install -r requirements.txt`,
+  `EXPOSE 8000`, default CMD runs uvicorn on `0.0.0.0:8000`.
+- `railway.toml` (new, repo root). Declares `builder = "dockerfile"`,
+  `startCommand` that binds to `$PORT`, `healthcheckPath = "/health"`
+  with a 300 second timeout to cover the first cold boot, and an
+  `on_failure` restart policy with a 3 retry cap.
+- `backend/main.py`. CORS `allow_origins` now includes
+  `https://*.railway.app` alongside the Vercel frontend and
+  `http://localhost:3000`. No other changes.
+- `render.yaml`. Three line deprecation header added at the top
+  pointing at `railway.toml` and `Dockerfile`. Service definition
+  itself was left intact for reference.
+- `README.md`. Live-links section updated to remove the hardcoded
+  onrender.com URL. New `Backend deployment` section added with the
+  Railway story, the local Docker test commands, and the Railway
+  deploy steps. Stack section updated to list Railway as the primary
+  backend host.
+- `devlog.md`. This entry.
+
+### Verification
+
+- Docker build: pass. `docker build -t ragscope-backend-test .` completed
+  cleanly, image tagged successfully.
+- Local container health check: pass. Container started with
+  `--network=host --env-file .env`; `curl http://localhost:8000/health`
+  returned `{"status":"ok","timestamp":"2026-05-17T19:29:58..."}`.
+  Note: `--network=host` is needed locally because the dev `.env`
+  points `SUPABASE_URL` at `localhost:5433` (the docker-compose
+  pgvector container on the host). In Railway the env var will point
+  at the real Supabase pooler so this is a local-only quirk.
+- pytest: 106 / 106 passed.
+- npm run build (frontend): pass. All 6 static routes generated
+  successfully.
+
+### Pending manual action
+
+The user still needs to:
+
+1. Create the Railway project and connect this GitHub repo.
+2. Confirm Railway auto-detected the `Dockerfile` / `railway.toml`.
+3. Add every env var from `.env.example` via the Railway service
+   Variables tab.
+4. Trigger the first deploy and confirm the `/health` probe passes
+   within the 300 second timeout.
+5. Update `README.md` live-links section with the final Railway URL
+   once the service is live.
+
 No project files modified. No commits made.
