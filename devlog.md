@@ -934,3 +934,43 @@ how to serialise the `run_uuid` parameter on Render's image.
 - `python -m pytest`: 106 / 106 pass.
 - Commit `fix: register psycopg2 UUID adapter and cast run_id to str`
   pushed; Render redeploys.
+
+## 2026-05-17 - Diagnostic probes around add_task
+
+After the UUID fix the probe runs still stuck at `status=pending`
+with `error_message=null`. Render log inspection by the user
+showed POST /benchmark returns 202 but the
+`[DEBUG] add_task called for run_id=...` print at
+`backend/routers/benchmark.py:213` never appears. That print is
+synchronous in the route handler so its absence means the handler
+crashes somewhere between the row INSERT and the add_task call, and
+FastAPI swallows the exception silently while still returning 202.
+
+This commit instruments the dispatch loop with prints at every step
+so the next Render log will pin down the exact crash point:
+
+1. **Route-entry probe** before the loop, printing
+   `run_evaluation={run_evaluation!r}` so we can confirm the imported
+   function reference is not None or otherwise garbled.
+2. **Per-iteration probes** marking loop-start, pool-acquired,
+   INSERT-returned, conn-released, run_id-computed, and
+   about-to-call-add_task. Whichever print is the last to appear in
+   the Render log is the line immediately before the silent failure.
+3. **Broad `try/except BaseException` around the `add_task` call** that
+   prints `[DEBUG] add_task FAILED for run_id=... : <type>: <repr>`
+   if the call itself raises, then re-raises. Catches everything
+   including SystemExit and GeneratorExit so the cause cannot escape
+   without leaving a trace.
+
+### Tests and deploy
+
+- `python -m pytest`: 106 / 106 pass. The probes are pure prints with
+  no logic change; test mocks ignore them.
+- Commit `debug: add probes around add_task to find silent crash`
+  pushed; Render redeploys.
+
+### Session H still deferred
+
+Do not run Session H. Wait for the user to capture the next batch of
+Render logs after a POST /benchmark and identify which probe was the
+last to fire.
