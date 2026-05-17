@@ -974,3 +974,238 @@ so the next Render log will pin down the exact crash point:
 Do not run Session H. Wait for the user to capture the next batch of
 Render logs after a POST /benchmark and identify which probe was the
 last to fire.
+
+## 2026-05-17 - Session H sweep: 40 / 40 completed, quality metrics all null
+
+Ran the full 10-questions x 4-strategies sweep against
+`corpus_hash=f5c424...0e93`. Backend infrastructure issues from
+earlier in the day were resolved (the dispatch path now reaches
+`_run_evaluation_async` and runs to `status=completed`). The full
+40-batch sweep finished in 225 s (3 min 45 s) - faster than expected
+- and the per-batch logs show every run reached terminal state with
+the answer text and retrieved chunks correctly written to the database.
+
+The catch: every quality metric on every run came back null.
+
+### Per-strategy summary table
+
+| Strategy | Faithfulness | Context utilization | Answer relevancy | Latency mean (min-max) |
+|----------|--------------|---------------------|------------------|------------------------|
+| naive | -- (n=0, nulls=10) | -- (n=0, nulls=10) | -- (n=0, nulls=10) | 16,229 ms (12,107-19,798) |
+| hyde | -- (n=0, nulls=10) | -- (n=0, nulls=10) | -- (n=0, nulls=10) | 16,810 ms (12,101-23,170) |
+| multiquery | -- (n=0, nulls=10) | -- (n=0, nulls=10) | -- (n=0, nulls=10) | 16,253 ms (11,563-25,925) |
+| hybrid | -- (n=0, nulls=10) | -- (n=0, nulls=10) | -- (n=0, nulls=10) | 15,665 ms (12,804-20,426) |
+
+All 40 runs: `status=completed`, `error_message=null`,
+`retrieved_chunks` populated with the expected chunks at sane scores,
+`generated_answer` populated with a coherent answer to the question.
+Only the three RAGAS scores are null.
+
+### Weighted winner
+
+Per the spec, nulls count as 0.0 in the weighted average
+(faithfulness 40%, context_utilization 30%, answer_relevancy 30%).
+With every metric null on every run:
+
+| Strategy | Weighted score |
+|----------|----------------|
+| naive | 0.0000 |
+| hyde | 0.0000 |
+| multiquery | 0.0000 |
+| hybrid | 0.0000 |
+
+Four-way tie at zero. No defensible winner can be declared on this data.
+
+If latency is used as a tiebreaker (lower is better), `hybrid` is
+fastest with a mean of 15.7 s and `hyde` is slowest at 16.8 s, a
+span of about 7 %.
+
+### Notable patterns
+
+1. **Every RAGAS metric on every run returned NaN.** That is 120
+   discrete metric computations (40 runs x 3 metrics) all failing the
+   same way. The per-metric isolation guard from Session C absorbed
+   them cleanly - each metric was wrapped in `try/except BaseException`,
+   stored as `float("nan")` on failure, and never propagated up to
+   crash the run. As a result, status stayed `completed` for every
+   row, which is the correct behaviour of the guard but hides the
+   underlying RAGAS problem from the run-level state.
+2. **Run latencies are 12-26 s, ~3-4 x faster than a real RAGAS run.**
+   Prior single-strategy probes routinely took 70-80 s end to end. A
+   full RAGAS evaluation on `gpt-4o-mini` against one
+   (question, answer, contexts) triple costs ~15-25 s per metric x
+   three metrics, so a healthy run should be dominated by RAGAS, not
+   by retrieval. The observed latencies are consistent with RAGAS
+   aborting near-instantly on each metric (the openai or langchain
+   call failing fast) rather than running to completion.
+3. **Retrieval and answer generation are healthy.** Spot-checking
+   completed rows shows the corpus is being retrieved correctly (2
+   chunks per query, top-1 score in the 0.5-0.6 range for naive on
+   relevant questions), and `gpt-4o-mini` is generating fluent
+   on-topic answers. The retriever / compressor / answer-generator
+   half of the pipeline is functioning normally.
+4. **Strategy-to-strategy latency differences are within 7 %.** With
+   only the retrieval+generation cost actually being incurred (and
+   RAGAS effectively no-op), all four strategies look roughly equal
+   on wall-clock. `hybrid` is fastest, `hyde` slowest, but the spread
+   is small enough that it could flip on any given run.
+
+### Likely cause of the RAGAS NaNs
+
+Three candidates, in priority order:
+
+1. **OpenAI API failure for the RAGAS judge calls specifically.**
+   The judge model is `gpt-4o-mini`, the same key the retriever and
+   answer generator use successfully. If the key is rate-limited at a
+   threshold that the four-stroke pipeline does not hit but the
+   amplified RAGAS call pattern does, the judge calls would all fail
+   while retrieval and generation proceed normally. Worth checking
+   OpenAI's usage dashboard for the period 06:23-06:27 UTC on
+   2026-05-17 against this key.
+2. **RAGAS internal error masked by per-metric `try/except`.** The
+   guard catches `BaseException`, which captures everything including
+   import errors, AttributeError, schema mismatches between RAGAS
+   versions and the dataset shape we pass in, etc. A change in
+   `ragas==0.1.21`'s dependency chain (e.g. a transitive bump in
+   `datasets` or `langchain`) could be raising at evaluate() time on
+   the Render image. Pinning is in place at the top level but
+   transitives are not.
+3. **A subtle bug introduced when the background-task path was
+   switched to psycopg2.** The corpus loaded via psycopg2 may have a
+   different shape than the asyncpg version expected by retrievers
+   (e.g. the embedding column comes back as numpy.ndarray rather than
+   list; we call `list(...)` on it, which is correct, but if the
+   array dtype is now float64 instead of float32, cosine similarity
+   would still work but downstream RAGAS calls might choke on a
+   subtle JSON-encoding issue). Unlikely - retrieval and generation
+   both succeed - but listed for completeness.
+
+### Recommendation for the next step
+
+Pull the Render stderr log for run_id
+`148ec61e-9bb4-428d-b46c-4fdc4ae76d06` (Q1, naive) and grep for
+`[DEBUG] _run_ragas: <metric> RAISED`. The per-metric isolation
+prints the exception type and message for each failing metric, which
+will point at one of the three candidates above. Until that root
+cause is known, re-running Session H will produce the same all-null
+table at the same wall-clock speed.
+
+### Files
+
+- `/tmp/session_h_results.csv` - 40 rows, all `status=completed`, all
+  three quality metrics empty, latency populated.
+- `/tmp/session_h_log.txt` - per-batch summary log with timestamps.
+- `devlog.md` - this entry.
+
+No project files modified. No commits made. The asyncpg / psycopg2
+backend work from earlier today is unchanged.
+
+## 2026-05-17 - Session H local run: full 40 runs with real metrics
+
+The Render sweep produced all-null quality metrics. To get a clean dataset
+the user redirected Session H to the local backend (`uvicorn backend.main:app
+--port 8000` against the local Docker Postgres on `localhost:5433`). Same
+10 questions, same 4 strategies, same parallel batches.
+
+### Setup
+
+- Started uvicorn locally (Python 3.11.2 venv).
+- Local Docker Postgres was already running on `localhost:5433`.
+- Local DB had zero chunks for the original `corpus_hash`, so the same
+  `/tmp/motor_vehicles.txt` (865 words, 2 chunks at default
+  `chunk_size=512`) was re-ingested via `POST localhost:8000/ingest`.
+  The hash is deterministic from file bytes, so it produced the same
+  `f5c424...0e93`.
+- `/tmp/session_h_local.py` is a copy of `/tmp/session_h_parallel.py`
+  with `BASE = "http://localhost:8000"`.
+
+### Per-strategy summary table
+
+| Strategy | Faithfulness | Context utilization | Answer relevancy | Latency mean (min-max) |
+|----------|--------------|---------------------|------------------|------------------------|
+| naive | 1.000 (n=10, nulls=0) | 1.000 (n=8, nulls=2) | 0.980 (n=9, nulls=1) | 23,486 ms (18,603-45,625) |
+| hyde | 1.000 (n=10, nulls=0) | 1.000 (n=9, nulls=1) | 0.989 (n=8, nulls=2) | 23,674 ms (19,848-34,909) |
+| multiquery | 1.000 (n=7, nulls=3) | 1.000 (n=9, nulls=1) | 0.974 (n=9, nulls=1) | 25,489 ms (18,606-52,736) |
+| hybrid | 0.990 (n=10, nulls=0) | 0.812 (n=8, nulls=2) | 0.982 (n=8, nulls=2) | 22,913 ms (18,601-34,896) |
+
+### Weighted winner
+
+Weighted average is `0.4 * faithfulness + 0.3 * context_utilization +
+0.3 * answer_relevancy`, with null metrics scored as 0.0 in the average.
+
+| Rank | Strategy | Weighted | f_mean | cu_mean | ar_mean |
+|------|----------|----------|--------|---------|---------|
+| 1 | **hyde** | **0.9073** | 1.000 | 0.900 | 0.791 |
+| 2 | naive | 0.9046 | 1.000 | 0.800 | 0.882 |
+| 3 | hybrid | 0.8266 | 0.990 | 0.650 | 0.785 |
+| 4 | multiquery | 0.8129 | 0.700 | 0.900 | 0.876 |
+
+**Winner: hyde** at 0.9073. The gap over `naive` is 0.0027 - within
+metric noise on this small corpus. The two are functionally tied;
+the 4-strategy ranking is really a tier-1 pair (hyde / naive) and a
+tier-2 pair (hybrid / multiquery) where each tier-2 strategy is held
+back by a different failure mode (hybrid's partial-utilization scores
+and multiquery's metric nulls).
+
+### Notable patterns
+
+1. **Faithfulness is near-perfect across all strategies.** Every
+   non-null faithfulness value is 1.0, except `hybrid` on Q4 at 0.9.
+   The corpus is short (~865 words / 2 chunks) and every question is
+   directly answerable from it, so the model stays tightly grounded
+   regardless of which strategy surfaces the chunks.
+2. **`hybrid`'s context_utilization sags.** Mean 0.812 on 8 non-null
+   values, dragged down by a 0.5 score on Q5, Q9, and Q10. Those are
+   RAGAS partial-credit values, not nulls. The most plausible
+   explanation: hybrid's RRF fusion of BM25 + dense surfaces
+   keyword-adjacent chunks for short corpora, and RAGAS notices the
+   model did not actually use part of the supplied context.
+3. **`multiquery` has the most nulls (5 / 40 = 12.5 %).** Three are
+   in faithfulness (Q6, Q8, Q10), one in context_utilization, one in
+   answer_relevancy. The Session C per-metric isolation absorbed all
+   of them cleanly. multiquery sends 3 reworded queries to the
+   generator + embedder, which produces more chunk overlap than the
+   other strategies; RAGAS faithfulness occasionally chokes when the
+   claim set looks ambiguous.
+4. **Latency ordering: hybrid fastest, multiquery slowest, spread
+   ~11 %.** hybrid 22.9 s vs multiquery 25.5 s. multiquery's overhead
+   is the LLM-generated query variants (~3-4 extra embedding calls
+   per question). hybrid's BM25 path is in-memory and adds essentially
+   zero wall-clock. The two single-embed strategies (naive, hyde) sit
+   in the middle at ~23.5 s.
+5. **Q1 hit the most nulls in the run (4 across 4 strategies).** That
+   was the first question submitted on a fresh local backend; the
+   matching question scored a clean 1.0 across all metrics on later
+   probes. Suggests a cold-RAGAS-cache warmup effect on the very first
+   evaluations of a session.
+6. **Q4 took the longest** - 45 s for naive, 52 s for multiquery
+   (vs the ~22 s median). The question elicits a longer multi-claim
+   answer from the model, and RAGAS faithfulness has to NLI-check
+   each claim against the context, so cost scales with answer length.
+7. **Local backend is ~3 x faster than Render free tier** on the same
+   workload (23 s mean here vs the 70-80 s prior single-strategy
+   probes on Render). Both call `gpt-4o-mini`; the difference is
+   Render's cold-start tax and constrained CPU.
+
+### Why this run worked when Render's did not
+
+On Render's sweep earlier today every quality metric came back null
+across all 40 runs - the Session C per-metric guard absorbed RAGAS
+failures uniformly. Locally those same metrics evaluate cleanly. The
+likely difference is one of: an OpenAI rate-limit that Render's IP
+hits but the user's local IP does not, a Render-side transitive
+dependency drift (`datasets` or `langchain` patch version) that the
+local venv pins to a working set, or a network-path issue between
+Render and `api.openai.com` specifically on the period the sweep ran.
+The runs against `localhost:8000` ran the identical code on the
+identical RAGAS pin (0.1.21) with the same OPENAI_API_KEY and
+returned real scores, so the issue is environmental, not code.
+
+### Files
+
+- `/tmp/session_h_local_results.csv` - 40 rows, all `status=completed`,
+  metric columns populated with floats or empty (= null).
+- `/tmp/session_h_local_log.txt` - per-batch summary log with timestamps.
+- `devlog.md` - this entry.
+
+No project files modified. No commits made.
