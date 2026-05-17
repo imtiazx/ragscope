@@ -26,7 +26,8 @@ This is NOT an agentic system. It is a deterministic evaluation pipeline.
 - Outbound HTTP: httpx (async, used in all LLM provider classes)
 - Tracing: LangSmith via langsmith package only (no langchain-core dependency)
 - Frontend: Next.js 14, Tailwind CSS, recharts, framer-motion, shadcn/ui
-- Deployment: Render (backend), Vercel (frontend), Supabase (DB)
+- Deployment: Railway (backend, primary host), Vercel (frontend), Supabase (DB).
+  Required deploy files at repo root: Dockerfile, railway.toml.
 
 ---
 
@@ -49,6 +50,13 @@ This is NOT an agentic system. It is a deterministic evaluation pipeline.
   Comments inside method bodies for any logic that is not immediately obvious
   to a Python beginner.
 - Background thread event loop: always use loop = asyncio.DefaultEventLoopPolicy().new_event_loop(), then loop.run_until_complete(...), then loop.close() in a finally block. Never use anyio.run() inside a FastAPI background task thread. Never call nest_asyncio.apply() against a uvloop instance.
+- DB access in background task (_run_evaluation_async) must use make_sync_connection()
+  (psycopg2 synchronous). Never use asyncpg pool or connection inside the background
+  task. asyncpg breaks on Python 3.14 due to asyncio.timeout() in its connect path.
+- RAGAS metrics must be evaluated one at a time using per-metric isolation:
+  three sequential ragas_evaluate(dataset, metrics=[one_metric]) calls, each
+  wrapped in try/except BaseException. Never evaluate all metrics in a single
+  evaluate() call. This pattern is required for graceful NaN handling.
 
 ---
 
@@ -342,10 +350,13 @@ def run_evaluation(...) -> None:
         loop.close()
 ```
 
-Inside _run_evaluation_async, pool = None must be initialised before the try block.
-pool = await make_task_pool() must be the first statement inside the try block.
+Inside _run_evaluation_async, conn = None must be initialised before the try block.
+conn = make_sync_connection() (synchronous psycopg2, no await) must be the
+first statement inside the try block. Do NOT use make_task_pool() or
+make_task_connection() inside _run_evaluation_async. Those use asyncpg which
+calls asyncio.timeout() internally and breaks on Python 3.14 under parallel load.
 The except BaseException block must update benchmark_runs status to failed and
-write the exception message to error_message before attempting pool close.
+write the exception message to error_message before attempting conn close.
 
 ---
 
@@ -353,10 +364,14 @@ write the exception message to error_message before attempting pool close.
 
 ragscope/
   CLAUDE.md
+  Dockerfile
+  railway.toml
   docker-compose.yml
   requirements.txt
   .env.example
   .gitignore
+  docs/
+    DEPLOYMENT_BLOCKER_REPORT.pdf
   backend/
     __init__.py
     main.py
