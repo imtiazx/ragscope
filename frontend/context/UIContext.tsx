@@ -54,8 +54,15 @@ function toastReducer(state: Toast[], action: ToastAction): Toast[] {
 
 interface UIContextValue {
   byokDrawerOpen: boolean
-  openBYOKDrawer: () => void
+  /**
+   * Open the BYOK drawer. When `onBack` is provided, the drawer surfaces a
+   * "Back" affordance in its header that invokes the callback (typically used
+   * to return the user to a parent modal that opened the drawer).
+   */
+  openBYOKDrawer: (options?: { onBack?: () => void }) => void
   closeBYOKDrawer: () => void
+  /** Callback to run when the drawer's Back button is pressed, or null. */
+  byokOnBack: (() => void) | null
   toasts: Toast[]
   /**
    * Add a toast notification. It auto-dismisses after `duration` ms
@@ -69,6 +76,7 @@ const UIContext = createContext<UIContextValue>({
   byokDrawerOpen: false,
   openBYOKDrawer:  () => {},
   closeBYOKDrawer: () => {},
+  byokOnBack:      null,
   toasts:          [],
   addToast:        () => '',
   dismissToast:    () => {},
@@ -80,10 +88,23 @@ const UIContext = createContext<UIContextValue>({
 
 export function UIContextProvider({ children }: { children: ReactNode }) {
   const [byokDrawerOpen, setByokDrawerOpen] = useState(false)
+  // Holds the onBack callback supplied by the caller that opened the drawer.
+  // Cleared every time the drawer closes so a stale callback cannot fire on
+  // a later, unrelated open.
+  const [byokOnBack, setByokOnBack] = useState<(() => void) | null>(null)
   const [toasts, dispatch] = useReducer(toastReducer, [])
 
-  const openBYOKDrawer  = useCallback(() => setByokDrawerOpen(true),  [])
-  const closeBYOKDrawer = useCallback(() => setByokDrawerOpen(false), [])
+  const openBYOKDrawer = useCallback(
+    (options?: { onBack?: () => void }) => {
+      setByokOnBack(() => options?.onBack ?? null)
+      setByokDrawerOpen(true)
+    },
+    []
+  )
+  const closeBYOKDrawer = useCallback(() => {
+    setByokDrawerOpen(false)
+    setByokOnBack(null)
+  }, [])
 
   const dismissToast = useCallback((id: string) => {
     dispatch({ type: 'DISMISS', id })
@@ -105,6 +126,7 @@ export function UIContextProvider({ children }: { children: ReactNode }) {
         byokDrawerOpen,
         openBYOKDrawer,
         closeBYOKDrawer,
+        byokOnBack,
         toasts,
         addToast,
         dismissToast,

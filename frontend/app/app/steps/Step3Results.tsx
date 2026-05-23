@@ -9,13 +9,17 @@
  * added to runHistory and the corresponding chart and table cells update
  * immediately - the dashboard does not wait for all strategies to finish.
  *
- * Strategies still in progress appear as "evaluating..." rows in the
- * comparison table. Failed strategies appear as error rows. Other charts
- * (radar, latency, score cards) only render once at least one strategy has
- * completed, since they have no data otherwise.
+ * Strategies still in progress do NOT show up in the comparison table.
+ * Instead, a banner at the top reports "M of N still evaluating" so the
+ * table only ever contains terminal rows (completed, failed). Failed runs
+ * appear as red rows; other charts (radar, latency, score cards) render
+ * once at least one strategy has completed.
  *
  * Run history persists across browser sessions in localStorage so the
  * comparison view accumulates across multiple benchmark submissions.
+ * Within the table, rows are split into "current submission" (the runs
+ * just kicked off in Step 2, in click order) and "Prior runs" (everything
+ * else), deduplicated by runId so the same run never appears twice.
  */
 
 import {
@@ -41,9 +45,10 @@ import {
   LineChart,
   Line,
 } from 'recharts'
-import { Trophy, ArrowLeft, RotateCcw, Trash2, ChevronUp, ChevronDown, Loader2 } from 'lucide-react'
+import { Trophy, ArrowLeft, RotateCcw, Trash2, ChevronUp, ChevronDown, Loader2, Info } from 'lucide-react'
 import { useAppContext, type RunResult } from '@/context/AppContext'
 import { getRunStatus } from '@/lib/api'
+import { formatLatency } from '@/lib/utils'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -105,13 +110,36 @@ function metricInterpretation(key: MetricKey, score: number): string {
   return bad
 }
 
+/**
+ * Per-metric weights used by the winner calculation. Latency is intentionally
+ * excluded from the score because latency is a cost dimension, not a quality
+ * one: a fast but wrong answer should not outrank a slower correct one. Null
+ * metrics are treated as zero so a run with a missing metric is penalised
+ * proportionally rather than silently inflated by removing it from the mean.
+ */
+const SCORE_WEIGHTS = {
+  faithfulness:       0.4,
+  contextUtilization: 0.3,
+  answerRelevancy:    0.3,
+} as const
+
+/**
+ * Compute the run's weighted average score in the [0, 1] range using
+ * SCORE_WEIGHTS. Null metrics contribute 0, so the formula stays consistent
+ * regardless of how many metrics RAGAS managed to produce.
+ */
 function weightedAverage(r: RunResult): number {
-  const vals = [r.faithfulness, r.contextUtilization, r.answerRelevancy].filter(
-    (v): v is number => v !== null
+  return (
+    (r.faithfulness        ?? 0) * SCORE_WEIGHTS.faithfulness +
+    (r.contextUtilization  ?? 0) * SCORE_WEIGHTS.contextUtilization +
+    (r.answerRelevancy     ?? 0) * SCORE_WEIGHTS.answerRelevancy
   )
-  if (vals.length === 0) return 0
-  return vals.reduce((s, v) => s + v, 0) / vals.length
 }
+
+const WINNER_FORMULA_TOOLTIP =
+  'Winner is the strategy with the highest weighted average score: ' +
+  'Faithfulness 40% + Context Utilization 30% + Answer Relevancy 30%. ' +
+  'Null metrics are scored as 0. Latency is not included in the score.'
 
 function strategyLabel(name: string): string {
   const map: Record<string, string> = {
@@ -241,7 +269,6 @@ function WinnerBadge({ runs }: { runs: RunResult[] }) {
   const cp = winner.contextUtilization ?? 0
   const ar = winner.answerRelevancy  ?? 0
   const bestMetric = fa >= cp && fa >= ar ? 'faithfulness' : cp >= ar ? 'context utilization' : 'answer relevancy'
-  const explanation = `Highest weighted average. Led on ${bestMetric}.`
 
   return (
     <div
@@ -262,9 +289,16 @@ function WinnerBadge({ runs }: { runs: RunResult[] }) {
           <span className="text-xs font-mono" style={{ color: 'var(--color-text-secondary)' }}>
             avg {(score * 100).toFixed(1)}%
           </span>
+          <InfoTooltip text={WINNER_FORMULA_TOOLTIP}>
+            <Info
+              size={13}
+              style={{ color: 'var(--color-text-secondary)', cursor: 'help' }}
+              aria-hidden="true"
+            />
+          </InfoTooltip>
         </div>
         <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
-          {explanation}
+          Highest weighted average. Led on {bestMetric}.
         </p>
       </div>
     </div>
@@ -422,7 +456,7 @@ function LatencyBars({
               color: 'var(--color-text-primary)',
             }}
             formatter={(value: number, _: string, props: { payload?: { id: string } }) => [
-              `${value.toLocaleString()} ms, ${latencyLabel(value)}`,
+              `${formatLatency(value)}, ${latencyLabel(value)}`,
               props.payload?.id ? strategyLabel(completed.find(r => r.runId === props.payload?.id)?.retrievalStrategy ?? '') : '',
             ]}
           />
@@ -443,8 +477,22 @@ function LatencyBars({
 }
 
 // ---------------------------------------------------------------------------
-// Comparison table (now also renders evaluating + failed live rows)
+// Comparison table
 // ---------------------------------------------------------------------------
+//
+// Pending strategies are NOT shown here -- the LiveProgressBanner above the
+// table communicates "M of N still evaluating" instead. Only terminal rows
+// (completed, failed) render in the table so the row count stays consistent
+// with the run state.
+//
+// Rows are split into two sections:
+//   - Current submission: runs whose runId is in state.runIds, ordered to
+//     match the selectedStrategies click order
+//   - Prior runs: history rows whose runId is not in the current submission,
+//     separated by a faint divider row labelled "Prior runs"
+//
+// Newly arrived rows (recorded in newRunIds for one render tick) get a
+// subtle slide/fade transition the first time they paint.
 
 interface FailedRow {
   strategy: string
@@ -452,26 +500,29 @@ interface FailedRow {
 }
 
 function ComparisonTable({
-  runs,
-  evaluating,
+  currentRuns,
+  priorRuns,
   failed,
   selectedId,
+  newRunIds,
   onSelect,
 }: {
-  runs: RunResult[]
-  evaluating: string[]
-  failed: FailedRow[]
-  selectedId: string | null
-  onSelect: (id: string) => void
+  currentRuns: RunResult[]
+  priorRuns:   RunResult[]
+  failed:      FailedRow[]
+  selectedId:  string | null
+  newRunIds:   Set<string>
+  onSelect:    (id: string) => void
 }) {
   const [sortKey, setSortKey] = useState<SortKey>('faithfulness')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
-  const completed = runs.filter(r => r.status === 'completed')
-  const hasAnything = completed.length > 0 || evaluating.length > 0 || failed.length > 0
+  const completed = [...currentRuns, ...priorRuns]
+  const hasAnything = completed.length > 0 || failed.length > 0
   if (!hasAnything) return null
 
-  // Best / worst computed over completed rows only; live rows are not ranked.
+  // Best / worst computed across all completed rows so colour-coding is
+  // consistent whether the cell sits in the current or prior section.
   const safeMin = (vals: number[]) => (vals.length ? Math.min(...vals) : Infinity)
   const safeMax = (vals: number[]) => (vals.length ? Math.max(...vals) : -Infinity)
 
@@ -488,13 +539,22 @@ function ComparisonTable({
     latencyMs:           safeMax(completed.map(r => r.latencyMs          ?? -Infinity)),
   }
 
-  const sorted = [...completed].sort((a, b) => {
-    const va = a[sortKey as keyof RunResult] as number ?? 0
-    const vb = b[sortKey as keyof RunResult] as number ?? 0
-    // For latency: lower is better, so flip the comparison for 'desc'
-    const flip = sortKey === 'latencyMs' ? -1 : 1
-    return sortDir === 'desc' ? flip * (vb - va) : flip * (va - vb)
-  })
+  /**
+   * Sort runs by the active sort key. Sorting only reorders within each
+   * section -- we never interleave current and prior rows, since the divider
+   * row would lose its meaning if rows crossed it.
+   */
+  const sortRuns = (rs: RunResult[]) =>
+    [...rs].sort((a, b) => {
+      const va = (a[sortKey as keyof RunResult] as number | null) ?? 0
+      const vb = (b[sortKey as keyof RunResult] as number | null) ?? 0
+      // Lower latency is better, so invert the sign for latency sorts.
+      const flip = sortKey === 'latencyMs' ? -1 : 1
+      return sortDir === 'desc' ? flip * (vb - va) : flip * (va - vb)
+    })
+
+  const sortedCurrent = sortRuns(currentRuns)
+  const sortedPrior   = sortRuns(priorRuns)
 
   const handleSort = (key: SortKey) => {
     if (key === sortKey) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
@@ -513,6 +573,54 @@ function ComparisonTable({
     if (value === best[key])  return '#4ADE80' // green for best
     if (value === worst[key] && completed.length > 1) return 'rgba(255,107,107,0.75)' // red for worst
     return 'var(--color-text-primary)'
+  }
+
+  /**
+   * Render a single body row for a completed run. Rows whose runId is in
+   * `newRunIds` get a brief enter transition so they fade in instead of
+   * popping when polling finishes.
+   */
+  const renderRow = (r: RunResult) => {
+    const isNew = newRunIds.has(r.runId)
+    return (
+      <tr
+        key={r.runId}
+        onClick={() => onSelect(r.runId)}
+        className="cursor-pointer transition-all duration-300 ease-out"
+        style={{
+          background: selectedId === r.runId
+            ? 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.04)'
+            : 'transparent',
+          borderBottom: '1px solid var(--color-border)',
+          // Newly arrived rows start slightly translated and faded; the
+          // transition above carries them to the resting state on the next
+          // tick.
+          opacity:   isNew ? 0 : 1,
+          transform: isNew ? 'translateY(-4px)' : 'translateY(0)',
+        }}
+        aria-selected={selectedId === r.runId}
+        role="row"
+      >
+        <td className="px-4 py-3 font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {strategyLabel(r.retrievalStrategy)}
+        </td>
+        {(['faithfulness', 'contextUtilization', 'answerRelevancy'] as MetricKey[]).map(k => (
+          <td
+            key={k}
+            className="px-4 py-3 text-center font-mono font-semibold"
+            style={{ color: cellColor(k, r[k]) }}
+          >
+            {r[k] !== null ? (r[k]! * 100).toFixed(1) + '%' : '--'}
+          </td>
+        ))}
+        <td
+          className="px-4 py-3 text-center font-mono"
+          style={{ color: cellColor('latencyMs', r.latencyMs) }}
+        >
+          {r.latencyMs !== null ? formatLatency(r.latencyMs) : '--'}
+        </td>
+      </tr>
+    )
   }
 
   return (
@@ -557,63 +665,10 @@ function ComparisonTable({
             </tr>
           </thead>
           <tbody>
-            {sorted.map(r => (
-              <tr
-                key={r.runId}
-                onClick={() => onSelect(r.runId)}
-                className="transition-colors cursor-pointer"
-                style={{
-                  background: selectedId === r.runId ? 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.04)' : 'transparent',
-                  borderBottom: '1px solid var(--color-border)',
-                }}
-                aria-selected={selectedId === r.runId}
-                role="row"
-              >
-                <td className="px-4 py-3 font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  {strategyLabel(r.retrievalStrategy)}
-                </td>
-                {(['faithfulness', 'contextUtilization', 'answerRelevancy'] as MetricKey[]).map(k => (
-                  <td key={k} className="px-4 py-3 text-center font-mono font-semibold"
-                    style={{ color: cellColor(k, r[k]) }}>
-                    {r[k] !== null ? (r[k]! * 100).toFixed(1) + '%' : '--'}
-                  </td>
-                ))}
-                <td className="px-4 py-3 text-center font-mono" style={{ color: cellColor('latencyMs', r.latencyMs) }}>
-                  {r.latencyMs !== null ? `${Math.round(r.latencyMs).toLocaleString()} ms` : '--'}
-                </td>
-              </tr>
-            ))}
+            {sortedCurrent.map(renderRow)}
 
-            {/* Live "evaluating..." rows for strategies still being scored. */}
-            {evaluating.map(name => (
-              <tr
-                key={`eval-${name}`}
-                className="transition-colors"
-                style={{
-                  background: 'rgba(255,255,255,0.02)',
-                  borderBottom: '1px solid var(--color-border)',
-                }}
-                aria-live="polite"
-                role="row"
-              >
-                <td className="px-4 py-3 font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                  <span className="inline-flex items-center gap-2">
-                    <Loader2
-                      size={12}
-                      className="animate-spin"
-                      style={{ color: 'var(--color-accent)' }}
-                      aria-hidden="true"
-                    />
-                    {strategyLabel(name)}
-                  </span>
-                </td>
-                <td colSpan={4} className="px-4 py-3 text-center" style={{ color: 'var(--color-text-secondary)' }}>
-                  evaluating...
-                </td>
-              </tr>
-            ))}
-
-            {/* Failed rows */}
+            {/* Failed rows belong to the current submission and sit at the
+                bottom of the current section. */}
             {failed.map(({ strategy, errorMessage }) => (
               <tr
                 key={`fail-${strategy}`}
@@ -632,6 +687,28 @@ function ComparisonTable({
                 </td>
               </tr>
             ))}
+
+            {/* Divider row + prior-session runs, only when there is at least
+                one prior run that is not part of the current submission. */}
+            {sortedPrior.length > 0 && (
+              <tr
+                aria-hidden="true"
+                style={{
+                  background: 'var(--color-surface)',
+                  borderTop:    '1px solid var(--color-border)',
+                  borderBottom: '1px solid var(--color-border)',
+                }}
+              >
+                <td
+                  colSpan={5}
+                  className="px-4 py-2 text-[10px] font-semibold tracking-widest uppercase"
+                  style={{ color: 'var(--color-text-secondary)' }}
+                >
+                  Prior runs
+                </td>
+              </tr>
+            )}
+            {sortedPrior.map(renderRow)}
           </tbody>
         </table>
       </div>
@@ -668,33 +745,44 @@ function ScoreCard({
       : ''
 
   const formatted = isLatency
-    ? `${Math.round(animated).toLocaleString()} ms`
+    ? formatLatency(animated)
     : `${(animated * 100).toFixed(1)}%`
 
+  // The card is split into three vertical zones so every metric card lines
+  // up regardless of string lengths:
+  //   top    -- label, fixed
+  //   middle -- value, vertically centered (flex-1 + justify-center)
+  //   bottom -- interpretation, fixed at the floor
+  // The optional sparkline tucks in below the description.
   return (
-    <div
-      className="card flex flex-col gap-3"
-      style={{ minHeight: '160px' }}
-    >
+    <div className="card flex flex-col h-full">
       <p className="metric-label">{label}</p>
 
+      <div className="flex-1 flex flex-col justify-center py-2">
+        <p
+          className="text-3xl font-black font-mono leading-none"
+          style={{ color: value === null ? 'var(--color-text-secondary)' : 'var(--color-text-primary)' }}
+          aria-label={`${label}: ${formatted}`}
+        >
+          {value !== null ? formatted : '--'}
+        </p>
+      </div>
+
       <p
-        className="text-3xl font-black font-mono leading-none"
-        style={{ color: value === null ? 'var(--color-text-secondary)' : 'var(--color-text-primary)' }}
-        aria-label={`${label}: ${formatted}`}
+        className="text-xs leading-snug"
+        style={{
+          color: 'var(--color-text-secondary)',
+          // Keep the bottom band the same height across cards regardless of
+          // whether an interpretation string is present, so labels and
+          // values line up across the 2x2 grid.
+          minHeight: '2.5rem',
+        }}
       >
-        {value !== null ? formatted : '--'}
+        {interpretation}
       </p>
 
-      {interpretation && (
-        <p className="text-xs leading-snug flex-1" style={{ color: 'var(--color-text-secondary)' }}>
-          {interpretation}
-        </p>
-      )}
-
-      {/* Sparkline -- shown when there are 2+ values for this metric */}
       {sparkValues.length >= 2 && (
-        <div className="h-8 mt-auto" aria-hidden="true">
+        <div className="h-8 mt-2" aria-hidden="true">
           <ResponsiveContainer width="100%" height={32}>
             <LineChart data={sparkValues.map((v, i) => ({ i, v }))}>
               <Line
@@ -721,12 +809,18 @@ function ScoreCards({ run, allRuns }: { run: RunResult; allRuns: RunResult[] }) 
   const sparkFor = (key: MetricKey | 'latencyMs') =>
     forStrategy.map(r => (r[key as keyof RunResult] as number | null) ?? 0).reverse()
 
+  /*
+   * 2x2 grid (`grid-rows-2`) so the cards stretch to fill the radar panel's
+   * height when the parent uses items-stretch. `h-full` on the wrapper plus
+   * `h-full` on each card ensures internal zones line up regardless of how
+   * tall the row becomes.
+   */
   return (
-    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 xl:gap-6">
-      <ScoreCard label="Faithfulness"      value={run.faithfulness}     metricKey="faithfulness"     sparkValues={sparkFor('faithfulness')}     delay={0}   />
+    <div className="grid grid-cols-2 grid-rows-2 gap-4 xl:gap-6 h-full">
+      <ScoreCard label="Faithfulness"        value={run.faithfulness}       metricKey="faithfulness"       sparkValues={sparkFor('faithfulness')}       delay={0}   />
       <ScoreCard label="Context Utilization" value={run.contextUtilization} metricKey="contextUtilization" sparkValues={sparkFor('contextUtilization')} delay={80}  />
-      <ScoreCard label="Answer Relevancy"  value={run.answerRelevancy}  metricKey="answerRelevancy"  sparkValues={sparkFor('answerRelevancy')}  delay={160} />
-      <ScoreCard label="Latency"           value={run.latencyMs}        metricKey="latencyMs"        sparkValues={sparkFor('latencyMs')}        delay={240} />
+      <ScoreCard label="Answer Relevancy"    value={run.answerRelevancy}    metricKey="answerRelevancy"    sparkValues={sparkFor('answerRelevancy')}    delay={160} />
+      <ScoreCard label="Latency"             value={run.latencyMs}          metricKey="latencyMs"          sparkValues={sparkFor('latencyMs')}          delay={240} />
     </div>
   )
 }
@@ -745,8 +839,8 @@ export default function Step3Results() {
   const strategies = state.selectedStrategies
   const history = state.runHistory
 
-  // Map runId -> strategy for the current submission. Used by evaluating
-  // and failed rendering to label each pending row with its strategy name.
+  // Map runId -> strategy for the current submission. Used by failed-row
+  // rendering to label each error row with the strategy that produced it.
   const strategyByRunId = useMemo(() => {
     const m: Record<string, string> = {}
     runIds.forEach((id, i) => { m[id] = strategies[i] ?? 'unknown' })
@@ -859,24 +953,102 @@ export default function Step3Results() {
     }
   }, [errorByRunId, runIds])
 
-  const completed = history.filter(r => r.status === 'completed')
-  const evaluating = pendingRunIds.map(id => strategyByRunId[id] ?? 'unknown')
+  /*
+   * Build a deduplicated list of completed runs keyed by runId. The history
+   * array already prepends new arrivals, so iterating in order and keeping
+   * the first occurrence of each runId gives the freshest copy. This guards
+   * against the corner case where a runId is somehow recorded twice (e.g.
+   * tab refresh mid-poll).
+   */
+  const completed = useMemo(() => {
+    const seen = new Set<string>()
+    const result: RunResult[] = []
+    for (const r of history) {
+      if (r.status !== 'completed') continue
+      if (seen.has(r.runId)) continue
+      seen.add(r.runId)
+      result.push(r)
+    }
+    return result
+  }, [history])
+
+  /*
+   * Runs that belong to the CURRENT submission, in the same click order the
+   * user picked in Step 2. We look each runId up by id rather than filtering
+   * `completed` so the order matches state.runIds exactly. Runs still
+   * pending have no entry in `completed` and are skipped here -- they show
+   * up in the LiveProgressBanner instead.
+   */
+  const currentRuns = useMemo(() => {
+    const byId = new Map(completed.map(r => [r.runId, r]))
+    return runIds
+      .map(id => byId.get(id))
+      .filter((r): r is RunResult => Boolean(r))
+  }, [completed, runIds])
+
+  /*
+   * Prior-session runs: anything in completed that is not part of the
+   * current submission. Deduplication by runId already happened above so
+   * this is a straightforward filter.
+   */
+  const priorRuns = useMemo(() => {
+    const currentSet = new Set(runIds)
+    return completed.filter(r => !currentSet.has(r.runId))
+  }, [completed, runIds])
+
   const failed = Object.entries(errorByRunId).map(([id, msg]) => ({
     strategy: strategyByRunId[id] ?? 'unknown',
     errorMessage: msg,
   }))
 
+  /*
+   * Track which runIds are "newly arrived" so their table rows can animate
+   * in with a fade/slide transition the first time they paint. seenRef is
+   * primed on the first effect run with whatever runs already exist (so
+   * history runs do not all animate together on mount); subsequent arrivals
+   * via polling get the transition.
+   */
+  const seenRef = useRef<Set<string> | null>(null)
+  const [newRunIds, setNewRunIds] = useState<Set<string>>(new Set())
+
+  useEffect(() => {
+    const allIds = [...currentRuns, ...priorRuns].map(r => r.runId)
+    if (seenRef.current === null) {
+      seenRef.current = new Set(allIds)
+      return
+    }
+    const newlyArrived = allIds.filter(id => !seenRef.current!.has(id))
+    if (newlyArrived.length === 0) return
+    newlyArrived.forEach(id => seenRef.current!.add(id))
+    setNewRunIds(prev => {
+      const next = new Set(prev)
+      newlyArrived.forEach(id => next.add(id))
+      return next
+    })
+    // Clear the "new" flag on the next tick so the row's resting style
+    // takes effect, triggering the CSS transition declared on the <tr>.
+    const t = setTimeout(() => {
+      setNewRunIds(prev => {
+        const next = new Set(prev)
+        newlyArrived.forEach(id => next.delete(id))
+        return next
+      })
+    }, 50)
+    return () => clearTimeout(t)
+  }, [currentRuns, priorRuns])
+
   // The score-card focus run: explicit selection wins; otherwise pick the
   // most recently completed run in the current submission, then fall back
-  // to the most recent in the entire history.
+  // to the most recent in the entire history. `completed` is already the
+  // deduped list, so this never returns the same runId twice.
   const selectedRun = useMemo(() => {
     if (selectedId) {
-      const explicit = history.find(r => r.runId === selectedId)
-      if (explicit && explicit.status === 'completed') return explicit
+      const explicit = completed.find(r => r.runId === selectedId)
+      if (explicit) return explicit
     }
     const fromSubmission = completed.find(r => runIds.includes(r.runId))
     return fromSubmission ?? completed[0] ?? null
-  }, [selectedId, history, runIds, completed])
+  }, [selectedId, runIds, completed])
 
   const handleSelect = useCallback((id: string) => setSelectedId(id), [])
 
@@ -894,7 +1066,7 @@ export default function Step3Results() {
   if (
     runIds.length === 0 &&
     history.length === 0 &&
-    evaluating.length === 0 &&
+    pendingRunIds.length === 0 &&
     failed.length === 0
   ) {
     return (
@@ -953,14 +1125,18 @@ export default function Step3Results() {
       {/*
        * xl layout: radar chart LEFT, score cards RIGHT (side by side).
        * Below lg: stacked -- radar first, then score cards.
+       *
+       * `items-stretch` lets the right-hand column grow to match the radar
+       * panel's height. ScoreCards uses `h-full` + `grid-rows-2` so the
+       * four metric cards expand to fill that height in a 2x2 layout.
        */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 xl:gap-10 items-start">
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 xl:gap-10 items-stretch">
         <div className="card">
           <MetricRadar runs={completed} selectedId={selectedId} onSelect={handleSelect} />
         </div>
 
         {selectedRun && (
-          <div>
+          <div className="h-full">
             <ScoreCards run={selectedRun} allRuns={history} />
           </div>
         )}
@@ -973,12 +1149,14 @@ export default function Step3Results() {
         </div>
       )}
 
-      {/* Comparison table -- always rendered when there is anything to show */}
+      {/* Comparison table -- shows terminal rows only. Pending strategies
+          live in the LiveProgressBanner above. */}
       <ComparisonTable
-        runs={completed}
-        evaluating={evaluating}
+        currentRuns={currentRuns}
+        priorRuns={priorRuns}
         failed={failed}
         selectedId={selectedId}
+        newRunIds={newRunIds}
         onSelect={handleSelect}
       />
 

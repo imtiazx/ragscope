@@ -14,7 +14,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { X, Eye, EyeOff, Shield, Trash2, CheckCircle2, AlertCircle } from 'lucide-react'
+import { X, Eye, EyeOff, Shield, Trash2, CheckCircle2, AlertCircle, ArrowLeft } from 'lucide-react'
 import { useUI } from '@/context/UIContext'
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,18 @@ function broadcastByokChange(key: string | null) {
 // ---------------------------------------------------------------------------
 
 export default function BYOKDrawer() {
-  const { byokDrawerOpen, closeBYOKDrawer } = useUI()
+  const { byokDrawerOpen, closeBYOKDrawer, byokOnBack } = useUI()
+
+  /**
+   * Fires the onBack callback (typically reopens a parent modal) and closes
+   * the drawer. Used when the drawer was opened from the landing-page tier
+   * selection so the user can return to that selection without picking BYOK.
+   */
+  const handleBack = () => {
+    const cb = byokOnBack
+    closeBYOKDrawer()
+    cb?.()
+  }
 
   const [provider, setProvider]     = useState<Provider>('openai')
   const [keyInput, setKeyInput]     = useState('')
@@ -180,24 +191,36 @@ export default function BYOKDrawer() {
           >
             {/* Header */}
             <div
-              className="flex items-center justify-between px-6 pt-6 pb-4"
+              className="flex items-center justify-between px-6 pt-6 pb-4 gap-3"
               style={{ borderBottom: '1px solid var(--color-border)' }}
             >
-              <div>
-                <h2
-                  id="byok-drawer-title"
-                  className="text-base font-bold"
-                  style={{ color: 'var(--color-text-primary)' }}
-                >
-                  API Key Settings
-                </h2>
-                <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
-                  Bring your own key for unlimited access
-                </p>
+              <div className="flex items-center gap-2 min-w-0">
+                {byokOnBack && (
+                  <button
+                    onClick={handleBack}
+                    className="p-1.5 rounded-lg transition-colors flex-shrink-0"
+                    style={{ color: 'var(--color-text-secondary)' }}
+                    aria-label="Back to tier selection"
+                  >
+                    <ArrowLeft size={16} aria-hidden="true" />
+                  </button>
+                )}
+                <div className="min-w-0">
+                  <h2
+                    id="byok-drawer-title"
+                    className="text-base font-bold"
+                    style={{ color: 'var(--color-text-primary)' }}
+                  >
+                    API Key Settings
+                  </h2>
+                  <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
+                    Bring your own key for unlimited access
+                  </p>
+                </div>
               </div>
               <button
                 onClick={closeBYOKDrawer}
-                className="p-1.5 rounded-lg transition-colors"
+                className="p-1.5 rounded-lg transition-colors flex-shrink-0"
                 style={{ color: 'var(--color-text-secondary)' }}
                 aria-label="Close API key settings"
               >

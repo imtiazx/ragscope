@@ -14,11 +14,14 @@
  * No stock imagery, no emoji. Typography and spacing carry the design.
  */
 
+import { useState } from 'react'
 import { motion } from 'framer-motion'
 import Link from 'next/link'
 import { ArrowRight, BarChart2, FlaskConical, Layers } from 'lucide-react'
 import Nav from '@/components/Nav'
 import SnowflakeBackground from '@/components/SnowflakeBackground'
+import TierSelectionModal from '@/components/TierSelectionModal'
+import { useUI } from '@/context/UIContext'
 
 /** Shared variants for scroll-triggered reveals on every section below the hero. */
 const revealVariants = {
@@ -70,6 +73,23 @@ const FEATURES = [
 // ---- Page ------------------------------------------------------------------
 
 export default function LandingPage() {
+  /*
+   * Controls the tier-selection overlay shown when the user clicks any
+   * "Enter App" CTA on this page. We do not navigate to /app directly any
+   * more: the user picks Guest, BYOK, or Developer first and the modal
+   * routes them appropriately.
+   */
+  const [tierOpen, setTierOpen] = useState(false)
+  const { openBYOKDrawer } = useUI()
+
+  // When the user picks BYOK inside the modal, close the modal and slide
+  // open the global drawer. The drawer's Back button re-opens the modal so
+  // the user can change their mind without committing to a key.
+  const handleSelectByok = () => {
+    setTierOpen(false)
+    openBYOKDrawer({ onBack: () => setTierOpen(true) })
+  }
+
   return (
     <div className="min-h-screen flex flex-col" style={{ background: 'var(--color-bg)' }}>
       {/*
@@ -157,15 +177,16 @@ export default function LandingPage() {
           </p>
 
           {/* Primary CTA */}
-          <Link
-            href="/app"
+          <button
+            type="button"
+            onClick={() => setTierOpen(true)}
             className="inline-flex items-center gap-3 px-8 py-4 rounded-xl font-semibold text-base animate-glow-pulse transition-transform hover:scale-[1.03] active:scale-[0.98]"
             style={{ background: 'var(--color-accent)', color: 'var(--color-accent-text)' }}
             aria-label="Open the RAGScope application"
           >
             Enter App
             <ArrowRight size={18} aria-hidden="true" />
-          </Link>
+          </button>
 
           {/* Subtle secondary note */}
           <p
@@ -346,15 +367,16 @@ export default function LandingPage() {
               Start with your own corpus and question. Results in under a minute.
               No account required.
             </p>
-            <Link
-              href="/app"
+            <button
+              type="button"
+              onClick={() => setTierOpen(true)}
               className="inline-flex items-center gap-3 px-8 py-4 rounded-xl font-semibold text-base transition-transform hover:scale-[1.03] active:scale-[0.98]"
               style={{ background: 'var(--color-accent)', color: 'var(--color-accent-text)' }}
               aria-label="Open the RAGScope application"
             >
               Run your first benchmark
               <ArrowRight size={18} aria-hidden="true" />
-            </Link>
+            </button>
           </div>
         </div>
       </motion.section>
@@ -414,6 +436,14 @@ export default function LandingPage() {
           </nav>
         </div>
       </footer>
+
+      {/* Tier-selection overlay. Always mounted so AnimatePresence can play
+          the exit animation when the user dismisses it. */}
+      <TierSelectionModal
+        isOpen={tierOpen}
+        onClose={() => setTierOpen(false)}
+        onSelectByok={handleSelectByok}
+      />
     </div>
   )
 }

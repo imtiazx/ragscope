@@ -567,7 +567,7 @@ export default function Step4Chat() {
           </div>
           <button
             type="button"
-            onClick={openBYOKDrawer}
+            onClick={() => openBYOKDrawer()}
             className="text-xs font-semibold flex-shrink-0 transition-colors"
             style={{ color: 'var(--color-accent)' }}
             aria-label="Open BYOK settings to unlock unlimited chat"

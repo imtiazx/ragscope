@@ -97,7 +97,7 @@ export default function Nav() {
           </Link>
 
           <button
-            onClick={openBYOKDrawer}
+            onClick={() => openBYOKDrawer()}
             className="p-2 rounded-lg text-text-secondary hover:text-text-primary transition-colors"
             aria-label="Open API key settings"
           >
