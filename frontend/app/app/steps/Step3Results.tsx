@@ -1281,28 +1281,39 @@ export default function Step3Results() {
   }, [currentRuns, priorRuns])
 
   /*
-   * The winner of the current submission (or, if nothing in the submission
-   * has completed yet, the winner across all history). Drives the radar
-   * highlight, the latency-chart accent bar, and the default score-card
-   * focus so all three views stay consistent with the WinnerBadge.
+   * Winner is computed strictly from the current submission. Prior runs may
+   * have used different questions or corpora, so comparing their scores
+   * here would be misleading -- if currentRuns is empty (nothing finished
+   * yet) we surface no winner at all, and downstream consumers (radar
+   * highlight, latency accent bar, default score-card focus, winner badge)
+   * either hide or render in a neutral state.
    */
-  const winnerRun = useMemo(
-    () => pickWinner(currentRuns.length > 0 ? currentRuns : completed),
-    [currentRuns, completed],
-  )
+  const winnerRun = useMemo(() => pickWinner(currentRuns), [currentRuns])
 
-  // Focus run for the score cards. Explicit row click wins; otherwise we
-  // surface the winner so the cards do not silently track whichever result
-  // happened to arrive last from polling.
+  /*
+   * Focus run for the score cards and generated answer panel. The user can
+   * click a current-session row to pick a specific run; we never honour a
+   * click on a prior run, because the cards must stay scoped to the
+   * current session (different questions/corpora are not comparable).
+   */
   const selectedRun = useMemo(() => {
     if (selectedId) {
-      const explicit = completed.find(r => r.runId === selectedId)
+      const explicit = currentRuns.find(r => r.runId === selectedId)
       if (explicit) return explicit
     }
     return winnerRun
-  }, [selectedId, completed, winnerRun])
+  }, [selectedId, currentRuns, winnerRun])
 
-  const handleSelect = useCallback((id: string) => setSelectedId(id), [])
+  // Row clicks from the comparison table can target either the current
+  // section or the "Prior runs" section. Only current-session clicks are
+  // honoured; clicks on a prior row are intentionally ignored so the
+  // charts and score cards do not jump to a stale run from another corpus.
+  const handleSelect = useCallback(
+    (id: string) => {
+      if (runIds.includes(id)) setSelectedId(id)
+    },
+    [runIds],
+  )
 
   // Bumped whenever the user clears history (or when the polling state
   // transitions cleanly) so the EvaluationProgressCard restarts its
@@ -1441,36 +1452,44 @@ export default function Step3Results() {
         />
       ) : (
         <>
-          {/* Winner badge */}
-          <WinnerBadge runs={completed} />
+          {/*
+           * Winner badge is scoped strictly to the current session. If no
+           * current run has completed yet (e.g. only prior runs exist
+           * from a different corpus) the badge stays hidden -- we never
+           * fall back to a prior run as the "winner."
+           */}
+          <WinnerBadge runs={currentRuns} />
 
           {/*
            * xl layout: radar chart LEFT, score cards RIGHT (side by side).
            * Below lg: stacked -- radar first, then score cards.
            *
-           * `items-stretch` lets the right-hand column grow to match the
-           * radar panel's height. ScoreCards uses `h-full` + `grid-rows-2`
-           * so the four metric cards expand to fill that height in a 2x2
-           * layout. The radar's parent .card uses flex so the chart inside
-           * can claim flex-1 of the available height.
+           * Radar polygons, the radar legend, and the score cards are all
+           * driven by currentRuns only. Prior runs surface exclusively in
+           * the comparison table, since cross-corpus / cross-question
+           * comparisons here would be misleading.
            */}
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 xl:gap-10 items-stretch">
             <div className="card flex flex-col">
-              <MetricRadar runs={completed} selectedId={selectedId ?? winnerRun?.runId ?? null} onSelect={handleSelect} />
+              <MetricRadar
+                runs={currentRuns}
+                selectedId={selectedId ?? winnerRun?.runId ?? null}
+                onSelect={handleSelect}
+              />
             </div>
 
             {selectedRun && (
               <div className="h-full">
-                <ScoreCards run={selectedRun} allRuns={completed} />
+                <ScoreCards run={selectedRun} allRuns={currentRuns} />
               </div>
             )}
           </div>
 
-          {/* Latency bar chart -- full width */}
-          {completed.length > 0 && (
+          {/* Latency bar chart -- current session only. */}
+          {currentRuns.length > 0 && (
             <div className="card">
               <LatencyBars
-                runs={completed}
+                runs={currentRuns}
                 selectedId={selectedId}
                 winnerId={winnerRun?.runId ?? null}
                 onSelect={handleSelect}
@@ -1478,8 +1497,8 @@ export default function Step3Results() {
             </div>
           )}
 
-          {/* Comparison table -- shows terminal rows only. Pending strategies
-              live in the LiveProgressBanner above. */}
+          {/* Comparison table -- the only surface that surfaces prior runs.
+              Pending strategies live in the LiveProgressBanner above. */}
           <ComparisonTable
             currentRuns={currentRuns}
             priorRuns={priorRuns}
