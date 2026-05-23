@@ -174,7 +174,16 @@ class _MockRetriever:
     Used as the class stored in the mock retrieval_registry dict. The
     benchmark runner calls `cls(corpus=..., **params)` then `.retrieve()`,
     so we need both an __init__ and an async retrieve method.
+
+    The runner filters retrieval_params against ``param_schema`` before
+    calling the constructor, so a mock that wants to receive `top_k` must
+    declare it here. The schema mirrors the real retrievers' contract.
     """
+
+    param_schema: list[dict] = [
+        {"name": "top_k", "type": "int", "default": 5, "min": 1, "max": 20,
+         "description": "Number of chunks to return."},
+    ]
 
     def __init__(self, corpus: list, **kwargs) -> None:
         """Accept and ignore all construction arguments."""
@@ -437,6 +446,13 @@ async def test_retrieval_failure_is_caught_as_failed():
     pool, conn = _make_pool_and_conn()
 
     class _ExplodingRetriever:
+        # param_schema is required because the runner filters retrieval_params
+        # against it before passing them to the constructor.
+        param_schema: list[dict] = [
+            {"name": "top_k", "type": "int", "default": 5, "min": 1, "max": 20,
+             "description": "Number of chunks to return."},
+        ]
+
         def __init__(self, corpus, **kwargs):
             pass
 

@@ -490,12 +490,19 @@ async def _run_evaluation_async(
         print(f"[DEBUG] corpus loaded chunks={len(corpus)} run_id={run_id}", flush=True)
 
         # Step 3: initialise the retriever from the registry using the stored params.
-        # retrieval_params contains top_k plus any strategy-specific parameters.
-        # Passing **retrieval_params to the constructor works because every retriever
-        # accepts top_k and its own strategy params as constructor kwargs.
+        # retrieval_params is filtered down to the keys declared in the
+        # strategy's param_schema before being unpacked into the constructor.
+        # The frontend caches params per-strategy and may persist a stale key
+        # from a previously-selected strategy (e.g. hypothetical_doc_length
+        # from HyDE in a multiquery payload); without this filter the
+        # constructor would raise TypeError on the unknown keyword.
         retriever_cls = retrieval_registry[retrieval_strategy]
-        retriever = retriever_cls(corpus=corpus, **retrieval_params)
-        top_k = retrieval_params.get("top_k", 5)
+        valid_keys = {p["name"] for p in retriever_cls.param_schema}
+        filtered_params = {
+            k: v for k, v in retrieval_params.items() if k in valid_keys
+        }
+        retriever = retriever_cls(corpus=corpus, **filtered_params)
+        top_k = filtered_params.get("top_k", 5)
         results: list[RetrievalResult] = await retriever.retrieve(question, top_k)
 
         # Step 4: optionally compress each chunk to only query-relevant sentences.

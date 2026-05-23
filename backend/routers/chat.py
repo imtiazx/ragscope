@@ -235,12 +235,19 @@ async def chat(
         ]
 
         # Step 6: build the retriever from registry and run retrieval.
-        # retrieval_params is passed through to the constructor; the frontend
-        # is responsible for sending only keys that appear in the strategy's
-        # param_schema (which it pulls from GET /strategies).
+        # retrieval_params is filtered down to the keys declared in the
+        # strategy's param_schema before being unpacked into the constructor.
+        # This guards against the frontend forwarding a leftover param from a
+        # previously-selected strategy (e.g. HyDE's hypothetical_doc_length
+        # showing up in a multiquery request) which would otherwise raise
+        # TypeError: ... got an unexpected keyword argument.
         retriever_cls = retrieval_registry[body.retrieval_strategy]
-        retriever = retriever_cls(corpus=corpus, **body.retrieval_params)
-        top_k = body.retrieval_params.get("top_k", 5)
+        valid_keys = {p["name"] for p in retriever_cls.param_schema}
+        filtered_params = {
+            k: v for k, v in body.retrieval_params.items() if k in valid_keys
+        }
+        retriever = retriever_cls(corpus=corpus, **filtered_params)
+        top_k = filtered_params.get("top_k", 5)
         results = await retriever.retrieve(body.question, top_k)
 
         # Step 7: optional contextual compression. Reuses the same compressor
