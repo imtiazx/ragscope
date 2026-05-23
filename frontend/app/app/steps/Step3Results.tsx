@@ -45,7 +45,7 @@ import {
   LineChart,
   Line,
 } from 'recharts'
-import { Trophy, ArrowLeft, RotateCcw, Trash2, ChevronUp, ChevronDown, Loader2, Info } from 'lucide-react'
+import { Trophy, ArrowLeft, RotateCcw, Trash2, ChevronUp, ChevronDown, Loader2, Info, CheckCircle2 } from 'lucide-react'
 import { useAppContext, type RunResult } from '@/context/AppContext'
 import { getRunStatus } from '@/lib/api'
 import { formatLatency } from '@/lib/utils'
@@ -140,6 +140,38 @@ const WINNER_FORMULA_TOOLTIP =
   'Winner is the strategy with the highest weighted average score: ' +
   'Faithfulness 40% + Context Utilization 30% + Answer Relevancy 30%. ' +
   'Null metrics are scored as 0. Latency is not included in the score.'
+
+/**
+ * Pick the run with the highest weighted score from the given list. Returns
+ * null when the list is empty so callers can branch without a second length
+ * check. Used by WinnerBadge, LatencyBars (to highlight the winner's bar in
+ * accent teal), and the score-card default selection so all three always
+ * agree on which run is "the winner."
+ */
+function pickWinner(runs: RunResult[]): RunResult | null {
+  if (runs.length === 0) return null
+  return runs.reduce(
+    (best, r) => (weightedAverage(r) > weightedAverage(best) ? r : best),
+    runs[0],
+  )
+}
+
+/**
+ * Cycle of human-readable status messages shown beneath the spinner while
+ * any benchmark run is still pending. The list deliberately walks through
+ * retrieval, fusion, then RAGAS scoring so the user has a sense that
+ * something concrete is happening even when individual API calls are slow.
+ */
+const PROGRESS_MESSAGES: ReadonlyArray<string> = [
+  'Retrieving relevant chunks from your corpus...',
+  'Generating hypothetical documents with HyDE...',
+  'Running BM25 sparse search and dense vector search...',
+  'Merging results with Reciprocal Rank Fusion...',
+  'Scoring faithfulness with gpt-4o-mini as judge...',
+  'Measuring context utilization...',
+  'Evaluating answer relevancy...',
+  'Almost there, finalising RAGAS scores...',
+]
 
 function strategyLabel(name: string): string {
   const map: Record<string, string> = {
@@ -250,16 +282,188 @@ function LiveProgressBanner({
 }
 
 // ---------------------------------------------------------------------------
+// Evaluation progress card (engagement state shown before the first result)
+// ---------------------------------------------------------------------------
+//
+// While the user waits for the first run to finish there is otherwise
+// nothing on screen. This card keeps them engaged with three layers of
+// feedback:
+//   1. A spinning teal ring confirming work is happening
+//   2. A cycling status message that walks through stages of the pipeline
+//      every 3 seconds so the screen never feels frozen
+//   3. A wide progress bar that animates from 0% to 85% over 70 seconds and
+//      snaps to 100% when everything completes
+//   4. Per-strategy pills showing pending/done state alongside the score
+//      for any strategy that has already returned
+
+interface ProgressPill {
+  runId: string
+  strategy: string
+  done: boolean
+  score: number | null
+}
+
+function EvaluationProgressCard({
+  pills,
+  totalDone,
+  totalCount,
+  resetKey,
+}: {
+  pills: ProgressPill[]
+  totalDone: number
+  totalCount: number
+  /**
+   * Changes whenever the parent wants the card to reset its internal
+   * progress + message-cycle state (e.g. after Clear History). Used as a
+   * dependency in the effects below.
+   */
+  resetKey: number
+}) {
+  const [messageIdx, setMessageIdx] = useState(0)
+  // The bar starts at 0 and is set to 85% shortly after mount so the CSS
+  // transition has a frame to register the initial 0% before animating.
+  const [progress, setProgress] = useState(0)
+  const allDone = totalDone === totalCount && totalCount > 0
+
+  // Cycle the status message every 3 seconds. The interval reschedules
+  // itself whenever resetKey changes so a fresh evaluation starts at the
+  // first message instead of mid-cycle.
+  useEffect(() => {
+    setMessageIdx(0)
+    const id = setInterval(
+      () => setMessageIdx(i => (i + 1) % PROGRESS_MESSAGES.length),
+      3000,
+    )
+    return () => clearInterval(id)
+  }, [resetKey])
+
+  // Drive the progress bar: 0 -> 85% over 70s while pending, then snap to
+  // 100% once everything completes. The 100ms delay before the 85% kickoff
+  // lets the browser commit the initial 0% width so the CSS transition
+  // actually animates instead of jumping.
+  useEffect(() => {
+    setProgress(0)
+    if (allDone) {
+      setProgress(100)
+      return
+    }
+    const t = setTimeout(() => setProgress(85), 100)
+    return () => clearTimeout(t)
+  }, [resetKey, allDone])
+
+  return (
+    <div
+      className="card flex flex-col items-center gap-6 py-10 px-6"
+      role="status"
+      aria-live="polite"
+      aria-label={`Evaluating ${totalCount - totalDone} of ${totalCount} strategies`}
+    >
+      {/*
+       * Spinning ring built from a single div: the transparent top border
+       * combined with the accent colour on the other three creates the
+       * familiar "chasing arc" effect when spun.
+       */}
+      <div
+        className="w-12 h-12 rounded-full border-4 animate-spin"
+        style={{
+          borderColor: 'var(--color-accent)',
+          borderTopColor: 'transparent',
+        }}
+        aria-hidden="true"
+      />
+
+      {/*
+       * The current message fades in/out via key change. Using a key on the
+       * <p> element makes React unmount and remount it whenever messageIdx
+       * advances, so the CSS opacity transition triggers cleanly each cycle.
+       */}
+      <p
+        key={messageIdx}
+        className="text-sm text-center transition-opacity duration-500"
+        style={{
+          color: 'var(--color-text-secondary)',
+          // animation: a fresh node is rendered with opacity 1; the
+          // duration-500 transition on opacity is consumed naturally by
+          // the unmount/remount cycle so we do not need additional state.
+        }}
+      >
+        {PROGRESS_MESSAGES[messageIdx]}
+      </p>
+
+      {/* Thin progress bar -- transitions over 70s, locked at 85% until
+          everything finishes. */}
+      <div
+        className="w-full rounded-full h-1"
+        style={{ background: 'var(--color-border)' }}
+        aria-hidden="true"
+      >
+        <div
+          className="h-1 rounded-full"
+          style={{
+            background: 'var(--color-accent)',
+            width: `${progress}%`,
+            transition: allDone
+              ? 'width 400ms ease-out'
+              : 'width 70000ms ease-out',
+          }}
+        />
+      </div>
+
+      {/* Strategy pills: pulsing dot when pending, green check + score
+          when done. Gives the user granular visibility into which run
+          they are still waiting on. */}
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        {pills.map(p => (
+          <div
+            key={p.runId}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs"
+            style={{
+              background: p.done
+                ? 'rgba(74,222,128,0.08)'
+                : 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.06)',
+              border: `1px solid ${p.done
+                ? 'rgba(74,222,128,0.25)'
+                : 'rgba(var(--color-accent-r),var(--color-accent-g),var(--color-accent-b),0.2)'}`,
+              color: 'var(--color-text-primary)',
+            }}
+          >
+            {p.done ? (
+              <CheckCircle2
+                size={12}
+                style={{ color: '#4ADE80' }}
+                aria-hidden="true"
+              />
+            ) : (
+              <span
+                className="w-2 h-2 rounded-full animate-pulse"
+                style={{ background: 'var(--color-accent)' }}
+                aria-hidden="true"
+              />
+            )}
+            <span>{strategyLabel(p.strategy)}</span>
+            {p.done && p.score !== null && (
+              <span
+                className="font-mono"
+                style={{ color: 'var(--color-text-secondary)' }}
+              >
+                {(p.score * 100).toFixed(1)}%
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Winner badge
 // ---------------------------------------------------------------------------
 
 function WinnerBadge({ runs }: { runs: RunResult[] }) {
   const completed = runs.filter(r => r.status === 'completed')
-  if (completed.length === 0) return null
-
-  const winner = completed.reduce((best, r) =>
-    weightedAverage(r) > weightedAverage(best) ? r : best
-  , completed[0])
+  const winner = pickWinner(completed)
+  if (winner === null) return null
 
   const score = weightedAverage(winner)
   const name  = strategyLabel(winner.retrievalStrategy)
@@ -336,48 +540,55 @@ function MetricRadar({
   })
 
   return (
-    <div>
+    <div className="flex flex-col h-full">
       <h3 className="text-sm font-semibold mb-3" style={{ color: 'var(--color-text-primary)' }}>
         Strategy comparison
       </h3>
-      <ResponsiveContainer width="100%" height={280}>
-        <RadarChart data={data} cx="50%" cy="50%" outerRadius="75%">
-          <PolarGrid stroke="var(--color-border)" />
-          <PolarAngleAxis
-            dataKey="metric"
-            tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }}
-          />
-          {completed.map((r, i) => (
-            <Radar
-              key={r.runId}
-              name={strategyLabel(r.retrievalStrategy)}
-              dataKey={r.runId}
-              stroke={RUN_COLORS[i % RUN_COLORS.length]}
-              fill={RUN_COLORS[i % RUN_COLORS.length]}
-              fillOpacity={r.runId === selectedId ? 0.25 : 0.08}
-              strokeWidth={r.runId === selectedId ? 2 : 1}
-              strokeOpacity={r.runId === selectedId ? 1 : 0.6}
-              onClick={() => onSelect(r.runId)}
-              style={{ cursor: 'pointer' }}
+      {/* min-h-0 + flex-1 lets the chart actually shrink to fit the
+          available height without overflowing its flex parent. The
+          recharts ResponsiveContainer requires a sized parent so a fixed
+          minimum keeps the polygon readable when no other sibling forces a
+          taller row. */}
+      <div className="flex-1 min-h-0" style={{ minHeight: '280px' }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <RadarChart data={data} cx="50%" cy="50%" outerRadius="75%">
+            <PolarGrid stroke="var(--color-border)" />
+            <PolarAngleAxis
+              dataKey="metric"
+              tick={{ fill: 'var(--color-text-secondary)', fontSize: 11 }}
             />
-          ))}
-          <RechartsTooltip
-            contentStyle={{
-              background: 'var(--color-surface)',
-              border: '1px solid var(--color-border)',
-              borderRadius: '8px',
-              fontSize: '11px',
-              color: 'var(--color-text-primary)',
-            }}
-            formatter={(value: number, name: string) => [
-              (value * 100).toFixed(1) + '%',
-              name,
-            ]}
-          />
-        </RadarChart>
-      </ResponsiveContainer>
+            {completed.map((r, i) => (
+              <Radar
+                key={r.runId}
+                name={strategyLabel(r.retrievalStrategy)}
+                dataKey={r.runId}
+                stroke={RUN_COLORS[i % RUN_COLORS.length]}
+                fill={RUN_COLORS[i % RUN_COLORS.length]}
+                fillOpacity={r.runId === selectedId ? 0.25 : 0.08}
+                strokeWidth={r.runId === selectedId ? 2 : 1}
+                strokeOpacity={r.runId === selectedId ? 1 : 0.6}
+                onClick={() => onSelect(r.runId)}
+                style={{ cursor: 'pointer' }}
+              />
+            ))}
+            <RechartsTooltip
+              contentStyle={{
+                background: 'var(--color-surface)',
+                border: '1px solid var(--color-border)',
+                borderRadius: '8px',
+                fontSize: '11px',
+                color: 'var(--color-text-primary)',
+              }}
+              formatter={(value: number, name: string) => [
+                (value * 100).toFixed(1) + '%',
+                name,
+              ]}
+            />
+          </RadarChart>
+        </ResponsiveContainer>
+      </div>
       {/* Legend */}
-      <div className="flex flex-wrap gap-3 mt-2">
+      <div className="flex flex-wrap gap-3 mt-3">
         {completed.map((r, i) => (
           <button
             key={r.runId}
@@ -409,10 +620,12 @@ function MetricRadar({
 function LatencyBars({
   runs,
   selectedId,
+  winnerId,
   onSelect,
 }: {
   runs: RunResult[]
   selectedId: string | null
+  winnerId:   string | null
   onSelect: (id: string) => void
 }) {
   const completed = runs
@@ -427,13 +640,28 @@ function LatencyBars({
     latency: Math.round(r.latencyMs ?? 0),
   }))
 
+  // The accent colour is whichever run the user clicked on; if nothing has
+  // been selected yet the winner gets the spotlight so the chart always has
+  // one bar that stands out. Other bars take a muted slate border colour so
+  // they fade into the chart background.
+  const highlightedId = selectedId ?? winnerId
+  const ACCENT_FILL = 'var(--color-accent)'
+  const MUTED_FILL  = 'var(--color-border)'
+
   return (
     <div>
       <h3 className="text-sm font-semibold mb-3" style={{ color: 'var(--color-text-primary)' }}>
         Retrieval latency
       </h3>
-      <ResponsiveContainer width="100%" height={180}>
-        <BarChart data={data} barCategoryGap="35%">
+      <ResponsiveContainer width="100%" height={220}>
+        <BarChart
+          data={data}
+          barCategoryGap="35%"
+          // barSize caps each bar's pixel width so a single tall bar does
+          // not visually dominate the chart when latency values are similar.
+          barSize={48}
+          margin={{ top: 12, right: 16, bottom: 8, left: 8 }}
+        >
           <XAxis
             dataKey="name"
             tick={{ fill: 'var(--color-text-secondary)', fontSize: 10 }}
@@ -444,7 +672,13 @@ function LatencyBars({
             tick={{ fill: 'var(--color-text-secondary)', fontSize: 10 }}
             axisLine={false}
             tickLine={false}
-            tickFormatter={v => `${(v / 1000).toFixed(1)}s`}
+            // domain [0, 'auto'] anchors the bottom at zero so the bar
+            // heights communicate absolute latency, not relative differences.
+            domain={[0, 'auto']}
+            // Reuse formatLatency so the y-axis ticks match the format used
+            // in score cards and the comparison table ("72.524 s" not "72524").
+            tickFormatter={v => formatLatency(v)}
+            width={64}
           />
           <RechartsTooltip
             cursor={{ fill: 'rgba(255,255,255,0.03)' }}
@@ -461,10 +695,10 @@ function LatencyBars({
             ]}
           />
           <Bar dataKey="latency" radius={[4, 4, 0, 0]}>
-            {data.map((d, i) => (
+            {data.map(d => (
               <Cell
                 key={d.id}
-                fill={selectedId === d.id || !selectedId ? RUN_COLORS[i % RUN_COLORS.length] : 'var(--color-border)'}
+                fill={highlightedId === d.id ? ACCENT_FILL : MUTED_FILL}
                 onClick={() => onSelect(d.id)}
                 style={{ cursor: 'pointer' }}
               />
@@ -570,6 +804,15 @@ function ComparisonTable({
 
   function cellColor(key: string, value: number | null): string {
     if (value === null) return 'var(--color-text-secondary)'
+    // Latency is graded on absolute thresholds, not relative position, so a
+    // single fast run does not paint the only row green and a single slow
+    // run does not paint everything red. Thresholds reflect what feels
+    // "fast vs sluggish" on this benchmark surface specifically.
+    if (key === 'latencyMs') {
+      if (value <= 30_000) return '#4ADE80'           // green:  0 - 30 s
+      if (value <= 60_000) return '#F59E0B'           // amber: 30 - 60 s
+      return 'rgba(255,107,107,0.85)'                  // red:  60 s and up
+    }
     if (value === best[key])  return '#4ADE80' // green for best
     if (value === worst[key] && completed.length > 1) return 'rgba(255,107,107,0.75)' // red for worst
     return 'var(--color-text-primary)'
@@ -748,17 +991,17 @@ function ScoreCard({
     ? formatLatency(animated)
     : `${(animated * 100).toFixed(1)}%`
 
-  // The card is split into three vertical zones so every metric card lines
-  // up regardless of string lengths:
-  //   top    -- label, fixed
-  //   middle -- value, vertically centered (flex-1 + justify-center)
-  //   bottom -- interpretation, fixed at the floor
-  // The optional sparkline tucks in below the description.
+  // Three fixed vertical zones so every card lines up:
+  //   1. Label, anchored at the top
+  //   2. Value, vertically centred in the remaining space (flex-1 + items-center)
+  //   3. Description, anchored at the bottom; min-height keeps alignment
+  //      consistent across cards with shorter/missing interpretation text
+  // The optional sparkline tucks below the description when present.
   return (
-    <div className="card flex flex-col h-full">
+    <div className="card flex flex-col justify-between h-full p-4">
       <p className="metric-label">{label}</p>
 
-      <div className="flex-1 flex flex-col justify-center py-2">
+      <div className="flex-1 flex items-center justify-start">
         <p
           className="text-3xl font-black font-mono leading-none"
           style={{ color: value === null ? 'var(--color-text-secondary)' : 'var(--color-text-primary)' }}
@@ -772,9 +1015,9 @@ function ScoreCard({
         className="text-xs leading-snug"
         style={{
           color: 'var(--color-text-secondary)',
-          // Keep the bottom band the same height across cards regardless of
-          // whether an interpretation string is present, so labels and
-          // values line up across the 2x2 grid.
+          // Reserve a constant bottom band so all four cards close at the
+          // same baseline regardless of how long the interpretation string
+          // is (or whether there is one at all).
           minHeight: '2.5rem',
         }}
       >
@@ -816,7 +1059,7 @@ function ScoreCards({ run, allRuns }: { run: RunResult; allRuns: RunResult[] }) 
    * tall the row becomes.
    */
   return (
-    <div className="grid grid-cols-2 grid-rows-2 gap-4 xl:gap-6 h-full">
+    <div className="grid grid-cols-2 grid-rows-2 gap-3 h-full">
       <ScoreCard label="Faithfulness"        value={run.faithfulness}       metricKey="faithfulness"       sparkValues={sparkFor('faithfulness')}       delay={0}   />
       <ScoreCard label="Context Utilization" value={run.contextUtilization} metricKey="contextUtilization" sparkValues={sparkFor('contextUtilization')} delay={80}  />
       <ScoreCard label="Answer Relevancy"    value={run.answerRelevancy}    metricKey="answerRelevancy"    sparkValues={sparkFor('answerRelevancy')}    delay={160} />
@@ -1037,30 +1280,94 @@ export default function Step3Results() {
     return () => clearTimeout(t)
   }, [currentRuns, priorRuns])
 
-  // The score-card focus run: explicit selection wins; otherwise pick the
-  // most recently completed run in the current submission, then fall back
-  // to the most recent in the entire history. `completed` is already the
-  // deduped list, so this never returns the same runId twice.
+  /*
+   * The winner of the current submission (or, if nothing in the submission
+   * has completed yet, the winner across all history). Drives the radar
+   * highlight, the latency-chart accent bar, and the default score-card
+   * focus so all three views stay consistent with the WinnerBadge.
+   */
+  const winnerRun = useMemo(
+    () => pickWinner(currentRuns.length > 0 ? currentRuns : completed),
+    [currentRuns, completed],
+  )
+
+  // Focus run for the score cards. Explicit row click wins; otherwise we
+  // surface the winner so the cards do not silently track whichever result
+  // happened to arrive last from polling.
   const selectedRun = useMemo(() => {
     if (selectedId) {
       const explicit = completed.find(r => r.runId === selectedId)
       if (explicit) return explicit
     }
-    const fromSubmission = completed.find(r => runIds.includes(r.runId))
-    return fromSubmission ?? completed[0] ?? null
-  }, [selectedId, runIds, completed])
+    return winnerRun
+  }, [selectedId, completed, winnerRun])
 
   const handleSelect = useCallback((id: string) => setSelectedId(id), [])
 
+  // Bumped whenever the user clears history (or when the polling state
+  // transitions cleanly) so the EvaluationProgressCard restarts its
+  // message-cycle and progress-bar animations from scratch.
+  const [progressResetKey, setProgressResetKey] = useState(0)
+
   const handleClearHistory = () => {
+    // If runs are still mid-flight, confirm before wiping their results;
+    // otherwise the user clicks Clear by mistake and loses output that the
+    // backend is about to produce.
+    if (pendingRunIds.length > 0) {
+      const ok = window.confirm(
+        'Evaluations are still running. Clearing history will remove their ' +
+        'results when they finish. Continue?',
+      )
+      if (!ok) return
+    }
     clearHistory()
     dispatch({ type: 'SET_RUN_IDS', payload: [] })
     dispatch({ type: 'SET_SELECTED_STRATEGIES', payload: [] })
     setSelectedId(null)
+    // Pre-populate completedRunIds with the now-empty runIds list so the
+    // polling effect sees an empty pendingRunIds set and tears down cleanly.
     setCompletedRunIds(new Set())
     setErrorByRunId({})
     addedRef.current = new Set()
+    // Re-arm the EvaluationProgressCard so its next appearance starts at the
+    // first message and 0% progress instead of mid-animation.
+    setProgressResetKey(k => k + 1)
   }
+
+  /*
+   * One pill per current-submission run, in click order. Pending pills show
+   * the strategy and a pulse dot; completed pills show the strategy plus a
+   * green check and weighted score.
+   */
+  const progressPills: ProgressPill[] = useMemo(
+    () =>
+      runIds.map((id, i) => {
+        const r = completed.find(x => x.runId === id) ?? null
+        return {
+          runId: id,
+          strategy: strategies[i] ?? 'unknown',
+          done: r !== null,
+          score: r !== null ? weightedAverage(r) : null,
+        }
+      }),
+    [runIds, strategies, completed],
+  )
+
+  /*
+   * Show the engagement card only before the first run of the current
+   * submission reaches a terminal state. As soon as at least one current
+   * run succeeds OR fails we drop back to the standard dashboard so the
+   * user sees partial data immediately; the LiveProgressBanner above the
+   * dashboard still indicates "M of N still evaluating" until everything
+   * finishes. We also keep the engagement card hidden when there is no
+   * current submission at all (so the dashboard can render the user's
+   * prior history without interruption).
+   */
+  const showProgressCard =
+    runIds.length > 0 &&
+    pendingRunIds.length > 0 &&
+    currentRuns.length === 0 &&
+    failed.length === 0
 
   // ---- Render: empty state (no current submission and no history)
   if (
@@ -1119,46 +1426,70 @@ export default function Step3Results() {
         </div>
       )}
 
-      {/* Winner badge */}
-      <WinnerBadge runs={completed} />
-
       {/*
-       * xl layout: radar chart LEFT, score cards RIGHT (side by side).
-       * Below lg: stacked -- radar first, then score cards.
-       *
-       * `items-stretch` lets the right-hand column grow to match the radar
-       * panel's height. ScoreCards uses `h-full` + `grid-rows-2` so the
-       * four metric cards expand to fill that height in a 2x2 layout.
+       * Engagement card while nothing from the current submission has
+       * landed yet. Once the first result arrives we drop back to the
+       * dashboard layout below; the LiveProgressBanner continues to show
+       * "M of N still evaluating" until everything is done.
        */}
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 xl:gap-10 items-stretch">
-        <div className="card">
-          <MetricRadar runs={completed} selectedId={selectedId} onSelect={handleSelect} />
-        </div>
+      {showProgressCard ? (
+        <EvaluationProgressCard
+          pills={progressPills}
+          totalDone={progressPills.filter(p => p.done).length}
+          totalCount={progressPills.length}
+          resetKey={progressResetKey}
+        />
+      ) : (
+        <>
+          {/* Winner badge */}
+          <WinnerBadge runs={completed} />
 
-        {selectedRun && (
-          <div className="h-full">
-            <ScoreCards run={selectedRun} allRuns={history} />
+          {/*
+           * xl layout: radar chart LEFT, score cards RIGHT (side by side).
+           * Below lg: stacked -- radar first, then score cards.
+           *
+           * `items-stretch` lets the right-hand column grow to match the
+           * radar panel's height. ScoreCards uses `h-full` + `grid-rows-2`
+           * so the four metric cards expand to fill that height in a 2x2
+           * layout. The radar's parent .card uses flex so the chart inside
+           * can claim flex-1 of the available height.
+           */}
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 xl:gap-10 items-stretch">
+            <div className="card flex flex-col">
+              <MetricRadar runs={completed} selectedId={selectedId ?? winnerRun?.runId ?? null} onSelect={handleSelect} />
+            </div>
+
+            {selectedRun && (
+              <div className="h-full">
+                <ScoreCards run={selectedRun} allRuns={completed} />
+              </div>
+            )}
           </div>
-        )}
-      </div>
 
-      {/* Latency bar chart -- full width */}
-      {completed.length > 0 && (
-        <div className="card">
-          <LatencyBars runs={completed} selectedId={selectedId} onSelect={handleSelect} />
-        </div>
+          {/* Latency bar chart -- full width */}
+          {completed.length > 0 && (
+            <div className="card">
+              <LatencyBars
+                runs={completed}
+                selectedId={selectedId}
+                winnerId={winnerRun?.runId ?? null}
+                onSelect={handleSelect}
+              />
+            </div>
+          )}
+
+          {/* Comparison table -- shows terminal rows only. Pending strategies
+              live in the LiveProgressBanner above. */}
+          <ComparisonTable
+            currentRuns={currentRuns}
+            priorRuns={priorRuns}
+            failed={failed}
+            selectedId={selectedId}
+            newRunIds={newRunIds}
+            onSelect={handleSelect}
+          />
+        </>
       )}
-
-      {/* Comparison table -- shows terminal rows only. Pending strategies
-          live in the LiveProgressBanner above. */}
-      <ComparisonTable
-        currentRuns={currentRuns}
-        priorRuns={priorRuns}
-        failed={failed}
-        selectedId={selectedId}
-        newRunIds={newRunIds}
-        onSelect={handleSelect}
-      />
 
       {/* Generated answer for selected run */}
       {selectedRun?.generatedAnswer && (
