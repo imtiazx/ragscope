@@ -419,14 +419,6 @@ export default function LandingPage() {
             >
               GitHub
             </a>
-            <a
-              href="https://hashnode.com/@imtiazx"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-accent transition-colors"
-            >
-              Hashnode
-            </a>
             <Link
               href="/docs"
               className="hover:text-accent transition-colors"
