@@ -95,7 +95,8 @@ async def health() -> dict:
     """
     Return a simple liveness signal.
 
-    Used by Render's health-check probe and by developers to confirm the
+    Used by Railway's health-check probe (configured in railway.toml with
+    a 300 second timeout) and by developers to confirm the
     server is running. Returns the current UTC timestamp so callers can
     verify the server clock is reasonable.
 

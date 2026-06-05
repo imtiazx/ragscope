@@ -99,7 +99,7 @@ async def get_pool() -> asyncpg.Pool:
 
     Subsequent calls return the same pool object without re-connecting.
     The pool size defaults to asyncpg's built-in minimum/maximum (10 connections)
-    which is appropriate for the expected concurrency on Render's free tier.
+    which is appropriate for the expected concurrency on Railway's free tier.
 
     Returns
     -------
@@ -133,14 +133,17 @@ async def make_task_pool() -> asyncpg.Pool:
     from a different loop raises an event-loop mismatch error. Creating a
     dedicated pool here avoids that entirely.
 
-    NOTE: on Python 3.14 (Render's current runtime), asyncpg's connect path
-    internally calls `asyncio.timeout()` which raises
+    NOTE: this defensive pattern exists because on Python 3.14 (the previous
+    Render host's runtime) asyncpg's connect path internally calls
+    `asyncio.timeout()` which raises
     `RuntimeError("Timeout should be used inside a task")` when
-    `current_task()` returns None during concurrent task creation. Passing
-    `timeout=None` and `command_timeout=None` skips the `asyncio.timeout()`
-    wrapper entirely - asyncpg waits indefinitely on the TCP connect
-    rather than racing it against a timer. The underlying socket connect
-    still fails fast if Supabase is unreachable; we just lose the
+    `current_task()` returns None during concurrent task creation. The
+    current Railway deployment pins Python 3.11.9 (see Dockerfile) where the
+    bug does not trigger, but the workaround is kept as belt-and-suspenders.
+    Passing `timeout=None` and `command_timeout=None` skips the
+    `asyncio.timeout()` wrapper entirely - asyncpg waits indefinitely on the
+    TCP connect rather than racing it against a timer. The underlying socket
+    connect still fails fast if Supabase is unreachable; we just lose the
     application-level cancellation deadline, which is acceptable here
     because the background-task event loop has nothing else to do anyway.
     `min_size=1`/`max_size=3` keeps the pool small so a stuck connection
@@ -211,14 +214,18 @@ def make_sync_connection():
     """
     Return a synchronous psycopg2 connection for use in background tasks.
 
-    asyncpg's connection path on Python 3.14 (Render's runtime) calls
-    asyncio.timeout() internally regardless of any timeout argument we
-    pass; it fires inside its compat module before the timeout value is
-    consulted, raising RuntimeError("Timeout should be used inside a
-    task") when current_task() returns None. Earlier sessions tried
+    asyncpg's connection path on Python 3.14 (the previous Render host's
+    runtime) calls asyncio.timeout() internally regardless of any timeout
+    argument we pass; it fires inside its compat module before the timeout
+    value is consulted, raising RuntimeError("Timeout should be used inside
+    a task") when current_task() returns None. Earlier sessions tried
     routing around this with loop.create_task() outer wrappers, direct
     asyncpg.connect() instead of pools, and timeout=None - none of those
-    landed reliably across every Render worker instance.
+    landed reliably across every Render worker instance. The current Railway
+    deployment pins Python 3.11.9 (see Dockerfile) so the original bug does
+    not trigger, but psycopg2 stays as the background-task driver because it
+    is simpler, blocks the dedicated task loop with no side effects, and
+    removes any future risk if the runtime is ever bumped.
 
     psycopg2 is fully synchronous and never touches asyncio at all, so
     it cannot trigger the failure mode by construction. The trade-off is

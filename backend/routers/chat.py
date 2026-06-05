@@ -263,7 +263,7 @@ async def chat(
         # Step 8: answer generation. _generate_answer uses provider.complete_sync()
         # internally, which blocks the event loop briefly during the LLM call.
         # Tier 1 chat is rate-limited to 5/day per user, so the blocking is
-        # acceptable for the expected concurrency on Render's free tier.
+        # acceptable for the expected concurrency on Railway's free tier.
         provider = OpenAIProvider()
         contexts = [r.content for r in results]
         answer = _generate_answer(body.question, contexts, provider)
