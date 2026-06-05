@@ -115,11 +115,6 @@ def _run_ragas(
     Postgres as 'NaN'::float8 and JSON-serialised as null when returned by
     the results endpoint.
 
-    Detailed [DEBUG] print probes surround each per-metric call so Render
-    stderr shows exactly which metric raised, and what asyncio.current_task()
-    returned at that moment - the failure mode the previous unified call
-    masked because RAGAS itself does not re-raise (raise_exceptions=False).
-
     Imports RAGAS and its datasets dependency lazily so this module is
     importable without those packages installed (tests mock this function).
     Declared as a regular (non-async) function because it runs inside
@@ -170,20 +165,6 @@ def _run_ragas(
         "contexts": [contexts],
     })
 
-    # Confirm we are inside an asyncio Task at entry. The outer wrapper
-    # (run_evaluation -> loop.create_task -> loop.run_until_complete) should
-    # guarantee this; if current_task() is None here, the task wrapper is
-    # not propagating and the asyncio.timeout() calls inside RAGAS / asyncpg
-    # are doomed.
-    try:
-        entry_task = asyncio.current_task()
-    except RuntimeError:
-        entry_task = None
-    print(
-        f"[DEBUG] _run_ragas: entry asyncio.current_task() = {entry_task!r}",
-        flush=True,
-    )
-
     # Per-metric ordered list. Evaluating one metric per ragas_evaluate() call
     # isolates failures: if context_utilization crashes inside RAGAS, faithfulness
     # and answer_relevancy still get computed.
@@ -196,42 +177,19 @@ def _run_ragas(
     scores: dict[str, float] = {}
 
     for key, metric in metric_defs:
-        # Re-check current_task() before each metric so logs show whether the
-        # task context survives across iterations or gets torn down by RAGAS
-        # internals partway through the loop.
-        try:
-            pre_task = asyncio.current_task()
-        except RuntimeError:
-            pre_task = None
-        print(
-            f"[DEBUG] _run_ragas: about to evaluate {key!r}, "
-            f"current_task() = {pre_task!r}",
-            flush=True,
-        )
-
         try:
             result = ragas_evaluate(dataset, metrics=[metric])
-            value = float(result[key])
-            scores[key] = value
-            print(
-                f"[DEBUG] _run_ragas: {key} = {value}",
-                flush=True,
-            )
+            scores[key] = float(result[key])
         except BaseException as exc:
             # Catch BaseException so SystemExit / KeyboardInterrupt / GeneratorExit
             # also get logged-and-NaN rather than aborting the whole pipeline.
             # The "Timeout should be used inside a task" RuntimeError raised by
             # asyncio.timeout() in RAGAS worker coroutines is captured here.
-            print(
-                f"[DEBUG] _run_ragas: {key} RAISED {type(exc).__name__}: {exc}",
-                flush=True,
-            )
             logger.exception(
                 "_run_ragas: metric %s raised %s", key, type(exc).__name__
             )
             scores[key] = float("nan")
 
-    print(f"[DEBUG] _run_ragas: returning scores = {scores}", flush=True)
     return scores
 
 
@@ -331,7 +289,6 @@ def run_evaluation(
         SHA-256 hex digest identifying the corpus in corpus_chunks. The task
         uses this to load the corpus itself from the database.
     """
-    print(f"[DEBUG] run_evaluation entered run_id={run_id}", flush=True)
     logger.info(
         "run_evaluation: starting run_id=%s strategy=%s",
         run_id,
@@ -366,7 +323,6 @@ def run_evaluation(
         # This outer handler catches anything that still escapes (e.g. an
         # error inside the async error handler itself). FastAPI swallows
         # exceptions from background tasks silently, so log here.
-        print(f"[DEBUG] run_evaluation CRASHED: {exc}", flush=True)
         logger.exception(
             "run_evaluation: unhandled crash for run_id=%s: %s", run_id, exc
         )
@@ -414,7 +370,9 @@ async def _run_evaluation_async(
     """
     # Synchronous psycopg2 connection. We use psycopg2 in the background
     # task path instead of asyncpg because asyncpg's connection code calls
-    # asyncio.timeout() unconditionally on Python 3.14 (Render's runtime),
+    # asyncio.timeout() unconditionally on Python 3.14 (previous Render host's
+    # runtime; Railway pins 3.11.9 so the bug is dormant but the workaround
+    # stays as a safety net),
     # raising "Timeout should be used inside a task" when current_task()
     # returns None during concurrent task creation. psycopg2 is fully sync
     # and never touches asyncio, so the failure mode does not exist for
@@ -442,7 +400,6 @@ async def _run_evaluation_async(
         # than propagating out and leaving the row permanently stuck in
         # 'pending'. make_sync_connection() is sync (no `await`).
         conn = make_sync_connection()
-        print(f"[DEBUG] conn opened run_id={run_id}", flush=True)
 
         # Step 1: mark the run as in-progress so the frontend stops showing "pending".
         # run_uuid is wrapped in str() as a defensive cast: psycopg2 should
@@ -456,7 +413,6 @@ async def _run_evaluation_async(
                 (str(run_uuid),),
             )
         conn.commit()
-        print(f"[DEBUG] status=running run_id={run_id}", flush=True)
 
         # Step 2: load the corpus. The corpus is never passed as an argument
         # to this function because serialising 100+ chunks (each carrying a
@@ -487,7 +443,6 @@ async def _run_evaluation_async(
             }
             for row in rows
         ]
-        print(f"[DEBUG] corpus loaded chunks={len(corpus)} run_id={run_id}", flush=True)
 
         # Step 3: initialise the retriever from the registry using the stored params.
         # retrieval_params is filtered down to the keys declared in the
@@ -522,7 +477,6 @@ async def _run_evaluation_async(
 
         # Step 6: run RAGAS metric computation synchronously.
         scores = _run_ragas(question, generated_answer, contexts)
-        print(f"[DEBUG] RAGAS complete scores={scores} run_id={run_id}", flush=True)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -542,7 +496,6 @@ async def _run_evaluation_async(
         # Step 7: write everything and mark as completed in a single statement
         # so the frontend never sees a partial state where scores are present but
         # status is still 'running'.
-        print(f"[DEBUG] step7 before UPDATE run_id={run_id}", flush=True)
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -575,8 +528,7 @@ async def _run_evaluation_async(
         # teardown noise (e.g. conn.close() raising) does not get treated as
         # a real failure by the outer except.
         completed_committed = True
-        print(f"[DEBUG] step7 UPDATE committed (completed_committed=True) run_id={run_id}", flush=True)
-        print(f"[DEBUG] status=completed run_id={run_id}", flush=True)
+        logger.info("_run_evaluation_async: status=completed run_id=%s", run_id)
 
     except BaseException as exc:
         # Catch BaseException (not just Exception) so that SystemExit,
@@ -587,11 +539,6 @@ async def _run_evaluation_async(
         # post-commit cleanup. Overwriting status to 'failed' here would
         # corrupt a successful run, so log-and-swallow.
         if completed_committed:
-            print(
-                f"[DEBUG] post-commit cleanup noise swallowed for run_id={run_id}: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
             logger.warning(
                 "_run_evaluation_async: post-commit cleanup exception swallowed "
                 "for run_id=%s (run already completed): %s",
@@ -599,7 +546,6 @@ async def _run_evaluation_async(
                 exc,
             )
             return
-        print(f"[DEBUG] _run_evaluation_async FAILED run_id={run_id}: {exc}", flush=True)
         logger.exception(
             "_run_evaluation_async: run_id=%s failed: %s", run_id, exc
         )
@@ -607,10 +553,6 @@ async def _run_evaluation_async(
             # Connection open itself failed; no DB handle is available to
             # write the failure status. Log and give up - we cannot do
             # anything else from a background thread without a connection.
-            print(
-                f"[DEBUG] conn is None for run_id={run_id}, skipping DB failure write",
-                flush=True,
-            )
             logger.error(
                 "_run_evaluation_async: conn is None for run_id=%s,"
                 " cannot write failed status",
@@ -638,25 +580,17 @@ async def _run_evaluation_async(
 
     finally:
         if conn is not None:
-            print(f"[DEBUG] finally: before conn.close run_id={run_id}", flush=True)
             try:
                 # psycopg2 conn.close() is synchronous. It never touches
                 # asyncio so it cannot trip the Python 3.14 timeout bug,
                 # but we still log-and-swallow any close error so the
                 # function returns cleanly with the final row state intact.
                 conn.close()
-                print(f"[DEBUG] finally: conn.close ok run_id={run_id}", flush=True)
-            except BaseException as close_exc:
-                print(
-                    f"[DEBUG] finally: conn.close RAISED "
-                    f"{type(close_exc).__name__}: {close_exc} run_id={run_id}",
-                    flush=True,
-                )
+            except BaseException:
                 logger.exception(
                     "_run_evaluation_async: conn.close failed for run_id=%s",
                     run_id,
                 )
-        print(f"[DEBUG] _run_evaluation_async: finally block done run_id={run_id}", flush=True)
 
 
 async def get_run(run_id: str) -> Optional[dict]:
